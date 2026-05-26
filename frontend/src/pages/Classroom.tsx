@@ -256,6 +256,18 @@ export const Classroom: React.FC<ClassroomProps> = ({
         }
       }
       
+      // 3. Unlock HTML5 Audio() autoplay
+      try {
+        const silentMp3 = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAAA";
+        const unlockAudioObj = new Audio(silentMp3);
+        unlockAudioObj.volume = 0;
+        unlockAudioObj.play()
+          .then(() => console.info("[HTML5 Audio Autoplay Unlock] HTML5 Audio successfully unlocked!"))
+          .catch((err) => console.warn("[HTML5 Audio Autoplay Unlock] Play rejected:", err));
+      } catch (err) {
+        console.warn("[HTML5 Audio Autoplay Unlock] Failed:", err);
+      }
+      
       // Remove listeners after first run
       window.removeEventListener('click', unlockAudio);
       window.removeEventListener('touchstart', unlockAudio);

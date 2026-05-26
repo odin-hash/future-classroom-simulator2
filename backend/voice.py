@@ -127,25 +127,16 @@ def _detect_script(text: str) -> str:
     return "english"
 
 
-async def _synthesize_edge_tts(text: str, voice: str, rate: str, pitch: str, output_path: str):
-    """
-    Runs Edge TTS synthesis asynchronously and saves to an MP3 file.
-    """
-    communicate = edge_tts.Communicate(
-        text=text,
-        voice=voice,
-        rate=rate,
-        pitch=pitch,
-    )
-    await communicate.save(output_path)
+# In-memory TTS Cache to eliminate any file read/write latency and disk dependency
+TTS_CACHE: Dict[str, bytes] = {}
 
 
-def generate_speech_audio(text: str, student_name: str, language: str = "English") -> str:
+async def generate_speech_audio(text: str, student_name: str, language: str = "English") -> bytes:
     """
     Main TTS synthesis function.
     Uses Microsoft Edge Neural TTS for natural, human-like voices.
-    Checks cache first, then generates new audio.
-    Returns the absolute path to the audio file.
+    Checks the in-memory cache first, then generates new audio bytes asynchronously.
+    Returns raw MP3 audio bytes.
     """
     clean_text = text.strip()
     if not clean_text:
@@ -168,54 +159,37 @@ def generate_speech_audio(text: str, student_name: str, language: str = "English
     # Generate cache key based on voice + prosody + text
     hash_payload = f"{voice}_{rate}_{pitch}_{clean_text}"
     text_hash = hashlib.md5(hash_payload.encode("utf-8")).hexdigest()
-    output_filename = f"speech_{text_hash}.mp3"
-    output_path = os.path.join(CACHE_DIR, output_filename)
 
-    # Cache hit — return immediately
-    if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
-        return output_path
+    # In-memory Cache hit — return bytes immediately
+    if text_hash in TTS_CACHE:
+        print(f"[Edge TTS] In-memory cache hit for '{clean_text[:30]}...'")
+        return TTS_CACHE[text_hash]
 
-    # Cache miss — synthesize with Edge TTS
+    # Cache miss — synthesize with Edge TTS asynchronously
     try:
-        print(f"[Edge TTS] Synthesizing for {student_name} ({voice}, rate={rate}, pitch={pitch}) -> '{clean_text[:50]}...'")
+        print(f"[Edge TTS] Synthesizing asynchronously for {student_name} ({voice}, rate={rate}, pitch={pitch}) -> '{clean_text[:50]}...'")
 
-        # Run async Edge TTS in a sync context
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        communicate = edge_tts.Communicate(
+            text=clean_text,
+            voice=voice,
+            rate=rate,
+            pitch=pitch,
+        )
 
-        if loop and loop.is_running():
-            # We're inside an existing event loop (e.g., FastAPI) — run in a new thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(
-                    asyncio.run,
-                    _synthesize_edge_tts(clean_text, voice, rate, pitch, output_path)
-                )
-                future.result(timeout=30)
-        else:
-            # No event loop running — just use asyncio.run
-            asyncio.run(_synthesize_edge_tts(clean_text, voice, rate, pitch, output_path))
+        audio_data = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data.extend(chunk["data"])
 
-        # Verify output and force disk synchronization
-        if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
-            try:
-                # Force the OS write buffer to flush to physical storage
-                with open(output_path, "a+b") as f:
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception as sync_err:
-                print(f"[Edge TTS] Sync warning (non-fatal): {sync_err}")
-                
-            print(f"[Edge TTS] Successfully generated and synced: {output_filename}")
-            return output_path
-        else:
-            raise FileNotFoundError(f"Generated audio file not found at {output_path}")
+        audio_bytes = bytes(audio_data)
+        if not audio_bytes:
+            raise ValueError("Synthesized audio data is empty.")
+
+        # Cache the bytes in memory
+        TTS_CACHE[text_hash] = audio_bytes
+        print(f"[Edge TTS] Successfully generated in-memory bytes ({len(audio_bytes)} bytes)")
+        return audio_bytes
 
     except Exception as e:
-        print(f"[Edge TTS Error] Synthesis failed: {e}")
-        # Clean up corrupt files
-        if os.path.exists(output_path):
-            os.remove(output_path)
+        print(f"[Edge TTS Error] Async synthesis failed: {e}")
         raise e

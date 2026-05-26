@@ -429,18 +429,22 @@ async def text_to_speech(text: str, student: str, language: str = "English"):
     if not text.strip() or not student.strip():
         raise HTTPException(status_code=400, detail="Missing required 'text' or 'student' query parameters.")
     try:
-        audio_path = generate_speech_audio(text, student, language)
-        if os.path.isfile(audio_path):
-            # Determine media type from file extension
-            media_type = "audio/mpeg" if audio_path.endswith(".mp3") else "audio/wav"
-            return FileResponse(
-                audio_path,
-                media_type=media_type,
-                filename=os.path.basename(audio_path),
-                headers={"Content-Disposition": "inline", "Accept-Ranges": "bytes"}
-            )
-        else:
-            raise HTTPException(status_code=500, detail="Generated audio file could not be verified on disk.")
+        # Await the fully async in-memory byte synthesis
+        audio_bytes = await generate_speech_audio(text, student, language)
+        
+        # Stream response directly from memory using BytesIO and StreamingResponse
+        from io import BytesIO
+        from fastapi.responses import StreamingResponse
+        
+        return StreamingResponse(
+            BytesIO(audio_bytes),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": "inline",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(len(audio_bytes))
+            }
+        )
     except Exception as e:
         print(f"TTS API Endpoint Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -452,23 +456,21 @@ def transcribe_google(audio_content: bytes, mime_type: str = "audio/webm") -> st
     client = speech.SpeechClient()
     audio = speech.RecognitionAudio(content=audio_content)
     
-    # Determine encoding based on MIME type
+    # Determine encoding based on MIME type (Omit hardcoded sample rates to let Google STT auto-detect)
     if "webm" in mime_type:
         encoding = speech.RecognitionConfig.AudioEncoding.WEBM_OPUS
-        sample_rate_hertz = 48000
     elif "ogg" in mime_type or "opus" in mime_type:
         encoding = speech.RecognitionConfig.AudioEncoding.OGG_OPUS
-        sample_rate_hertz = 48000
     else:
         encoding = speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED
-        sample_rate_hertz = None
         
     config = speech.RecognitionConfig(
         encoding=encoding,
-        sample_rate_hertz=sample_rate_hertz,
         language_code="en-IN",
         alternative_language_codes=["hi-IN", "bn-IN"],
         enable_automatic_punctuation=True,
+        use_enhanced=True,
+        model="latest_long"
     )
     response = client.recognize(config=config, audio=audio)
     transcript = ""
