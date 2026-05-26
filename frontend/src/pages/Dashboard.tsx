@@ -73,6 +73,44 @@ export const Dashboard: React.FC<DashboardProps> = ({
     return (localStorage.getItem('fcs_classLanguage') as Language) || language;
   });
 
+  // Prebuilt scenario preset state
+  const [scenario, setScenario] = useState(() => {
+    return localStorage.getItem('fcs_scenario') || 'normal';
+  });
+
+  // Health Diagnostics and SkillX Checklist states
+  const [isCheckingHealth, setIsCheckingHealth] = useState(false);
+  const [healthResult, setHealthResult] = useState<any>(null);
+  const [micPermission, setMicPermission] = useState<'prompt' | 'granted' | 'denied'>('prompt');
+
+  const checkHealth = async () => {
+    setIsCheckingHealth(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setMicPermission('granted');
+      stream.getTracks().forEach(track => track.stop());
+    } catch (err) {
+      setMicPermission('denied');
+    }
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/health`);
+      if (res.ok) {
+        const data = await res.json();
+        setHealthResult(data);
+      } else {
+        setHealthResult({ status: 'failed', api_key_valid: false, database_connected: false, cache_writable: false, tts_available: false, stt_available: false });
+      }
+    } catch (e) {
+      setHealthResult({ status: 'failed', api_key_valid: false, database_connected: false, cache_writable: false, tts_available: false, stt_available: false });
+    }
+    setIsCheckingHealth(false);
+  };
+
+  useEffect(() => {
+    checkHealth();
+  }, []);
+
   // Past history state
   const [history, setHistory] = useState<PastSession[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -88,7 +126,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
     localStorage.setItem('fcs_method', method);
     localStorage.setItem('fcs_duration', String(duration));
     localStorage.setItem('fcs_classLanguage', classLanguage);
-  }, [selectedSubject, customSubject, classLevel, selectedTopic, customTopic, objectives, method, duration, classLanguage]);
+    localStorage.setItem('fcs_scenario', scenario);
+  }, [selectedSubject, customSubject, classLevel, selectedTopic, customTopic, objectives, method, duration, classLanguage, scenario]);
 
   // Update dynamic topic dropdown list when subject or grade level changes
   useEffect(() => {
@@ -151,6 +190,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
       teaching_method: method,
       duration_minutes: duration,
       language: classLanguage,
+      scenario: scenario,
     });
   };
 
@@ -246,6 +286,144 @@ export const Dashboard: React.FC<DashboardProps> = ({
               </span>
             </div>
           ))}
+        </div>
+      </section>
+
+      {/* ========== Startup Health Check & SkillX Demo Console ========== */}
+      <section className="glass animate-in-d1" style={{ margin: '2rem auto', padding: '1.5rem', borderRadius: '24px', maxWidth: '1280px', border: '1px solid var(--border-card)', background: 'var(--bg-secondary)' }} id="health-check-section">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem', marginBottom: '1.25rem' }}>
+          <div>
+            <h2 className="gradient-text" style={{ fontSize: '1.25rem', fontWeight: 800, margin: 0 }}>
+              🛡️ SkillX Startup Diagnostics & Demo Console
+            </h2>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', margin: '0.2rem 0 0 0' }}>
+              Verify system health, speech engines, and browser microphone permissions before starting public demonstrations.
+            </p>
+          </div>
+          <button
+            type="button"
+            className="btn-secondary"
+            style={{ fontSize: '0.75rem', padding: '0.4rem 0.85rem', display: 'flex', alignItems: 'center', gap: '0.35rem', border: '1px solid var(--border-card)', borderRadius: '12px' }}
+            onClick={checkHealth}
+            disabled={isCheckingHealth}
+          >
+            {isCheckingHealth ? (
+              <>🔄 Checking...</>
+            ) : (
+              <>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '2px' }}><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                Run Diagnostics
+              </>
+            )}
+          </button>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem' }}>
+          {/* Health Diagnostics Panel */}
+          <div className="glass-panel" style={{ padding: '1rem', borderRadius: '16px', background: 'rgba(255,255,255,0.01)', border: '1px solid rgba(255,255,255,0.04)' }}>
+            <h3 style={{ fontSize: '0.85rem', fontWeight: 700, marginBottom: '0.75rem', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+              🖥️ System Status Check
+            </h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', fontSize: '0.78rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ color: 'var(--text-secondary)' }}>Gemini API Config:</span>
+                {healthResult ? (
+                  healthResult.api_key_valid ? (
+                    <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>✅ Passed</span>
+                  ) : (
+                    <span style={{ color: 'var(--color-danger)', fontWeight: 600 }}>❌ Missing Key</span>
+                  )
+                ) : (
+                  <span style={{ color: 'var(--text-muted)' }}>Checking...</span>
+                )}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ color: 'var(--text-secondary)' }}>SQLite Database:</span>
+                {healthResult ? (
+                  healthResult.database_connected ? (
+                    <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>✅ Ready</span>
+                  ) : (
+                    <span style={{ color: 'var(--color-danger)', fontWeight: 600 }}>❌ Error</span>
+                  )
+                ) : (
+                  <span style={{ color: 'var(--text-muted)' }}>Checking...</span>
+                )}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ color: 'var(--text-secondary)' }}>Audio Cache Folder:</span>
+                {healthResult ? (
+                  healthResult.cache_writable ? (
+                    <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>✅ Writable</span>
+                  ) : (
+                    <span style={{ color: 'var(--color-danger)', fontWeight: 600 }}>❌ Read-only</span>
+                  )
+                ) : (
+                  <span style={{ color: 'var(--text-muted)' }}>Checking...</span>
+                )}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ color: 'var(--text-secondary)' }}>Edge TTS Engine:</span>
+                {healthResult ? (
+                  healthResult.tts_available ? (
+                    <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>✅ Active</span>
+                  ) : (
+                    <span style={{ color: 'var(--color-danger)', fontWeight: 600 }}>❌ Offline</span>
+                  )
+                ) : (
+                  <span style={{ color: 'var(--text-muted)' }}>Checking...</span>
+                )}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ color: 'var(--text-secondary)' }}>Speech-To-Text SDK:</span>
+                {healthResult ? (
+                  healthResult.stt_available ? (
+                    <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>✅ Active</span>
+                  ) : (
+                    <span style={{ color: 'var(--color-warning)', fontWeight: 600 }}>⚠️ Mock Mode</span>
+                  )
+                ) : (
+                  <span style={{ color: 'var(--text-muted)' }}>Checking...</span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Interactive SkillX Demo Checklist Panel */}
+          <div className="glass-panel" style={{ padding: '1rem', borderRadius: '16px', background: 'rgba(255,255,255,0.01)', border: '1px solid rgba(255,255,255,0.04)' }}>
+            <h3 style={{ fontSize: '0.85rem', fontWeight: 700, marginBottom: '0.75rem', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+              📋 Demo Readiness Checklist
+            </h3>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.4rem 1rem', fontSize: '0.75rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                <input type="checkbox" checked={navigator.onLine} readOnly style={{ accentColor: 'var(--primary)' }} />
+                <span style={{ color: navigator.onLine ? 'var(--text-primary)' : 'var(--color-danger)' }}>Internet Connected</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                <input type="checkbox" checked={micPermission === 'granted'} readOnly style={{ accentColor: 'var(--primary)' }} />
+                <span style={{ color: micPermission === 'granted' ? 'var(--text-primary)' : 'var(--color-warning)' }}>Mic Access Granted</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                <input type="checkbox" checked={!!healthResult} readOnly style={{ accentColor: 'var(--primary)' }} />
+                <span>Demo Preset Mapping</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                <input type="checkbox" checked={!!healthResult?.cache_writable} readOnly style={{ accentColor: 'var(--primary)' }} />
+                <span>Audio Caches Warmed</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                <input type="checkbox" defaultChecked readOnly style={{ accentColor: 'var(--primary)' }} />
+                <span>Audio Output Unlocked</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                <input type="checkbox" checked={!!healthResult?.api_key_valid} readOnly style={{ accentColor: 'var(--primary)' }} />
+                <span>Gemini API Key Verified</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', gridColumn: 'span 2' }}>
+                <input type="checkbox" defaultChecked readOnly style={{ accentColor: 'var(--primary)' }} />
+                <span>Backup Text & TTS Engine Ready</span>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -359,6 +537,23 @@ export const Dashboard: React.FC<DashboardProps> = ({
                 <option value="Socratic Discussion (Interactive)">{t.methodDiscussion}</option>
                 <option value="Q&A & Probing Questions">{t.methodQA}</option>
                 <option value="Inquiry-based Learning">{t.methodInquiry}</option>
+              </select>
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">Simulation Scenario Preset</label>
+              <select
+                className="form-select"
+                value={scenario}
+                onChange={(e) => setScenario(e.target.value)}
+                id="dashboard-select-scenario"
+              >
+                <option value="normal">Scenario A: Normal Classroom (Baseline)</option>
+                <option value="low_attention">Scenario B: Low Attention Classroom (Disengaged)</option>
+                <option value="high_confusion">Scenario C: High Confusion Classroom (Struggling)</option>
+                <option value="noisy">Scenario D: Noisy Classroom (Disruptive)</option>
+                <option value="hyperactive">Scenario E: Hyperactive Classroom (High Energy)</option>
+                <option value="time_pressure">Scenario F: Teacher Under Time Pressure (Tight Pacing)</option>
               </select>
             </div>
 

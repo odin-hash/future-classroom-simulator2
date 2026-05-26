@@ -280,6 +280,50 @@ def _build_personality_prompt(
     # Build behavior rules string
     rules_str = "\n".join(f"  • {r}" for r in rules)
 
+    # Calculate dynamic classroom mood adaptations
+    mood_alerts = []
+    class_attention = classroom_state.get("attention", classroom_state.get("avg_class_attention", 75.0))
+    class_confusion = classroom_state.get("confusion", classroom_state.get("avg_class_confusion", 25.0))
+
+    if class_attention < 50.0:
+        if student_name.lower() == "vihaan":
+            mood_alerts.append(f"• ATTENTION ALERT ({class_attention}%): The classroom's average attention is low. You are extremely bored, zoned out, and distracted. Doodles, daydream, whisper, or give completely distracted, off-topic responses or just say 'Huh? Wait, what?'.")
+        elif student_name.lower() == "kabir":
+            mood_alerts.append(f"• ATTENTION ALERT ({class_attention}%): The classroom's average attention is low. You are bored and restless. Interrupt the teacher or other students, bragging or acting cocky about what you already know.")
+
+    if class_confusion > 55.0:
+        if student_name.lower() == "riya":
+            mood_alerts.append(f"• CONFUSION ALERT ({class_confusion}%): The classroom is highly confused. You are feeling completely lost. Ask a simple, basic clarification question (e.g., 'I don't get it', 'What does that word mean?', 'Could you explain again?').")
+        elif student_name.lower() == "ananya":
+            mood_alerts.append(f"• CONFUSION ALERT ({class_confusion}%): The classroom is highly confused. You are feeling overwhelmed, insecure, and extremely timid. Stay completely quiet. If forced to speak, give a highly hesitant, quiet, one-word response or just trail off with '...'")
+
+    mood_alerts_str = "\n".join(mood_alerts) if mood_alerts else "  • Class is balanced. Maintain normal character behaviors."
+
+    ds = memory.get("dynamic_state", {})
+    stress = ds.get("stress", 15.0)
+    mood = ds.get("mood", "normal")
+    relationships = memory.get("relationships", {})
+    
+    # Format relationships text for prompt injection
+    relationships_str = ""
+    if relationships:
+        rel_lines = []
+        for peer, info in relationships.items():
+            if isinstance(info, dict) and "trust" in info:
+                rel_lines.append(
+                    f"    - {peer}: Trust={round(info.get('trust', 50.0), 1)}/100, "
+                    f"Friendship={round(info.get('friendship', 50.0), 1)}/100, "
+                    f"Annoyance={round(info.get('annoyance', 10.0), 1)}/100, "
+                    f"Influence={round(info.get('influence', 30.0), 1)}/100, "
+                    f"Supportiveness={round(info.get('supportiveness', 50.0), 1)}/100"
+                )
+            else:
+                strength = info.get('strength', 1.0) if isinstance(info, dict) else 1.0
+                rel_lines.append(f"    - {peer}: dynamic relationship strength multiplier: {round(strength, 2)}x")
+        relationships_str = "\n".join(rel_lines)
+    else:
+        relationships_str = "    - No significant relationship influences active."
+
     return f"""You are {student_name}, a REAL {grade_key} school student in an Indian classroom.
 You are NOT an AI. You are a specific child with specific habits, fears, quirks, and ways of talking.
 
@@ -290,6 +334,10 @@ Confidence: {traits["confidence"]}/100
 Current Attention: {state.attention_level}/100
 Current Confusion: {state.confusion_level}/100
 Current Understanding: {state.understanding_level}/100
+Current Stress: {round(stress, 1)}/100
+Current Mood: {mood}
+Active Peer Relationships & Copying Influences:
+{relationships_str}
 Times you've spoken today: {state.participation_count}
 
 ═══ HOW YOU TALK (copy these speech patterns EXACTLY) ═══
@@ -306,8 +354,11 @@ Times you've spoken today: {state.participation_count}
 
 ═══ CLASSROOM RIGHT NOW ═══
 Subject: {session_info["subject"]} | Topic: {session_info["topic"]}
-Turn #{classroom_state["turn_number"]} | Energy: {classroom_state["energy_level"]}
-Class avg attention: {classroom_state["avg_class_attention"]}% | Class avg confusion: {classroom_state["avg_class_confusion"]}%
+Turn #{classroom_state["turn_number"]} | Energy: {classroom_state.get("energy", classroom_state.get("energy_level", "medium"))} | Engagement: {classroom_state.get("engagement", 70.0)}%
+Class avg attention: {class_attention}% | Class avg confusion: {class_confusion}%
+
+═══ DYNAMIC CLASS MOOD ADAPTATIONS (follow these immediately!) ═══
+{mood_alerts_str}
 
 ═══ RECENT CONVERSATION ═══
 {history_str}
@@ -324,6 +375,12 @@ Class avg attention: {classroom_state["avg_class_attention"]}% | Class avg confu
 6. If your confusion is above 60 → express genuine confusion in your character's way.
 7. If teacher said a greeting → greet back in YOUR character's style. Don't start discussing the topic.
 8. If teacher asked a question → attempt to answer (correctly/incorrectly based on your personality and understanding level).
+10. Humanization & Imperfections: Real students speak with natural imperfections. Depending on your current understanding level (<65), confidence (<60), or confusion (>50), occasionally include realistic speech imperfections such as:
+    - Hesitations/Fillers: "Umm...", "Uh...", "Ah...", "Wait...", "I think..."
+    - Uncertainty: sounding unsure, questioning your own response
+    - Changing confidence: correcting yourself midsentence or trailing off with "..."
+    - Occasional minor mistakes: giving a slightly incorrect or incomplete explanation.
+    Do NOT give textbook-perfect, clean answers unless your understanding is 100. Keep it subtle and natural.
 9. Language: {session_info["language"]}. Use Devanagari for Hindi, Bengali script for Bengali, English for English.
 
 Return ONLY raw JSON (no markdown, no ```json, just the object):
@@ -586,6 +643,7 @@ async def generate_student_reply(
     teacher_message: str,
     conversation_history: List[Dict[str, str]],
     active_event: Optional[str] = None,
+    is_interrupt: bool = False,
 ) -> Dict[str, Any]:
     """
     Generates a student response using personality-driven prompts.
@@ -676,6 +734,22 @@ async def generate_student_reply(
             if response_content:
                 cleaned = clean_json_response(response_content)
                 parsed = json.loads(cleaned)
+                
+                # Validate response uniqueness using SimulationValidationEngine
+                from validation import SimulationValidationEngine
+                st = memory.get("short_term", {})
+                last_responses = st.get("last_responses", [])
+                raw_response = parsed.get("response_text", "")
+                
+                healed_text = SimulationValidationEngine.validate_and_heal_response(
+                    student_name=student_name,
+                    personality_role=personality_profile.get("role", "Curious student"),
+                    response_text=raw_response,
+                    last_responses=last_responses,
+                    topic=topic
+                )
+                parsed["response_text"] = healed_text
+                
                 print(f"[AI] ✓ via {provider}: student={student_name}, emotion={parsed.get('emotion')}, text={parsed.get('response_text', '')[:80]}...")
 
                 # Update student state from AI deltas
@@ -701,6 +775,7 @@ async def generate_student_reply(
                     teacher_message=teacher_message,
                     memory_update_text=parsed.get("memory_update", ""),
                     turn_number=turn_number,
+                    is_interrupt=is_interrupt,
                 )
 
                 db.commit()
@@ -709,6 +784,7 @@ async def generate_student_reply(
                     "responding_student": student_name,
                     "response_text": parsed.get("response_text", ""),
                     "emotion": parsed.get("emotion", "normal"),
+                    "fallback_activated": False
                 }
 
         except json.JSONDecodeError as e:
@@ -728,6 +804,19 @@ async def generate_student_reply(
         memory=memory,
     )
 
+    # Heal repetitive fallback response
+    from validation import SimulationValidationEngine
+    st = memory.get("short_term", {})
+    last_responses = st.get("last_responses", [])
+    healed_fallback = SimulationValidationEngine.validate_and_heal_response(
+        student_name=student_name,
+        personality_role=student_personality,
+        response_text=fallback["response_text"],
+        last_responses=last_responses,
+        topic=topic
+    )
+    fallback["response_text"] = healed_fallback
+
     # Update memory even in fallback
     update_student_memory(
         state=state_rec,
@@ -736,10 +825,12 @@ async def generate_student_reply(
         teacher_message=teacher_message,
         memory_update_text=f"Responded to teacher about {topic}",
         turn_number=turn_number,
+        is_interrupt=is_interrupt,
     )
     state_rec.participation_count += 1
     db.commit()
 
+    fallback["fallback_activated"] = True
     return fallback
 
 
@@ -755,6 +846,17 @@ def _compute_session_metrics(
     Computes real, evidence-based metrics from the actual session data.
     These numbers are REAL — computed from DB records, not guessed by an LLM.
     """
+    from datetime import datetime
+    import re
+
+    def parse_ts(ts_str):
+        if not ts_str:
+            return None
+        try:
+            return datetime.fromisoformat(ts_str)
+        except Exception:
+            return None
+
     teacher_messages = [m for m in transcript if m["sender_type"] == "teacher"]
     student_messages = [m for m in transcript if m["sender_type"] == "student"]
     system_messages = [m for m in transcript if m["sender_type"] == "system"]
@@ -768,7 +870,7 @@ def _compute_session_metrics(
     all_students = {"Aarav", "Ananya", "Vihaan", "Ishaan", "Riya", "Kabir"}
     never_addressed = all_students - unique_speakers
 
-    # Students mentioned by teacher
+    # Students mentioned by teacher and teacher questions
     addressed_by_teacher = set()
     teacher_questions = 0
     for m in teacher_messages:
@@ -778,6 +880,49 @@ def _compute_session_metrics(
         for name in all_students:
             if name.lower() in text_lower:
                 addressed_by_teacher.add(name)
+
+    # ──── TEACHER SPEAKING STYLE ANALYSIS ────
+    teacher_filler_count = 0
+    teacher_open_questions = 0
+    teacher_total_duration = 0.0
+    teacher_total_words = 0
+
+    for i, m in enumerate(transcript):
+        if m["sender_type"] == "teacher":
+            text = m["message_text"]
+            words = text.split()
+            word_count = len(words)
+            teacher_total_words += word_count
+
+            # Count standard filler words/phrases case-insensitively as distinct units
+            fillers = re.findall(r'\b(um|uh|uhm|er|ah|like|actually|you\s+know)\b', text.lower())
+            teacher_filler_count += len(fillers)
+
+            # Count open-ended questions: ends in ? or contains ? and uses open words
+            if text.strip().endswith("?") or "?" in text:
+                is_open = any(q_word in text.lower() for q_word in ["why", "how", "explain", "what do you think", "describe", "elaborate", "tell me"])
+                if is_open:
+                    teacher_open_questions += 1
+
+            # Determine turn duration using timestamp difference
+            turn_duration = 0.0
+            ts_curr = parse_ts(m.get("timestamp"))
+            if ts_curr and i + 1 < len(transcript):
+                ts_next = parse_ts(transcript[i+1].get("timestamp"))
+                if ts_next:
+                    diff = (ts_next - ts_curr).total_seconds()
+                    # Bound turn duration to a realistic limit (1.5s to 300s)
+                    if 1.5 <= diff <= 300.0:
+                        turn_duration = diff
+
+            # Fallback to estimated speaking rate if timestamp difference is missing/invalid
+            if turn_duration == 0.0:
+                turn_duration = max(2.5, word_count / 2.17)  # 130 WPM is ~2.17 words per second
+
+            teacher_total_duration += turn_duration
+
+    # Calculate average Words Per Minute (WPM)
+    teacher_wpm = round((teacher_total_words / max(1.0, teacher_total_duration)) * 60, 1)
 
     # Student state averages
     avg_attention = sum(s.attention_level for s in student_states) / max(1, len(student_states))
@@ -802,12 +947,247 @@ def _compute_session_metrics(
         "students_never_addressed": list(never_addressed),
         "students_addressed_by_teacher": list(addressed_by_teacher),
         "teacher_questions_asked": teacher_questions,
+        "teacher_filler_count": teacher_filler_count,
+        "teacher_open_questions": teacher_open_questions,
+        "teacher_wpm": teacher_wpm,
+        "teacher_total_duration": round(teacher_total_duration, 1),
         "avg_student_attention": round(avg_attention, 1),
         "avg_student_confusion": round(avg_confusion, 1),
         "avg_student_understanding": round(avg_understanding, 1),
         "most_engaged_student": most_engaged,
         "most_confused_student": most_confused,
         "least_engaged_student": least_engaged,
+    }
+
+
+def _compute_adaptability_score(
+    transcript: List[Dict[str, str]],
+    student_states: List[StudentState],
+) -> Dict[str, Any]:
+    """
+    Computes a Teacher Adaptability Score (0-10) and feedback by analyzing:
+    1. Response to student confusion events (scaffold/explain actions after confusion)
+    2. Adjustment of speaking pace (WPM corrections)
+    3. Handling classroom interruptions (whispering / late entries focus actions)
+    4. Encouraging participation from silent/shy students (e.g. Ananya)
+    5. Shifting strategies (using blackboard, modes etc.)
+    """
+    teacher_messages = [m for m in transcript if m["sender_type"] == "teacher"]
+    
+    # 1. Responded to confusion (scaffold/explain_basic after confusion events or student confusion phrases)
+    confusion_events = 0
+    confusion_resolved = 0
+    
+    for idx, m in enumerate(transcript):
+        is_confusion = False
+        if m["sender_type"] == "system" and "confusion" in m["sender_name"].lower():
+            is_confusion = True
+        elif m["sender_type"] == "student" and any(w in m["message_text"].lower() for w in ["confused", "don't understand", "unclear", "explain again", "what does"]):
+            is_confusion = True
+            
+        if is_confusion:
+            confusion_events += 1
+            next_teacher = None
+            for next_m in transcript[idx+1:]:
+                if next_m["sender_type"] == "teacher":
+                    next_teacher = next_m
+                    break
+            if next_teacher:
+                msg_lower = next_teacher["message_text"].lower()
+                if "explain" in msg_lower or "scaffold" in msg_lower or "blackboard" in msg_lower or "[" in msg_lower or "analogy" in msg_lower:
+                    confusion_resolved += 1
+                    
+    conf_score = 10.0 if confusion_events == 0 else (confusion_resolved / confusion_events) * 10.0
+
+    # 2. Adjusted speaking pace (shorter messages after long ones)
+    pace_turns = 0
+    pace_adjusted = 0
+    for i in range(len(teacher_messages) - 1):
+        words_curr = len(teacher_messages[i]["message_text"].split())
+        words_next = len(teacher_messages[i+1]["message_text"].split())
+        
+        if words_curr > 45:
+            pace_turns += 1
+            if words_next <= 35:
+                pace_adjusted += 1
+                
+    pace_score = 10.0 if pace_turns == 0 else (pace_adjusted / pace_turns) * 10.0
+
+    # 3. Handled interruptions (focus/warn action after whispering/interruption event)
+    interruption_events = 0
+    interruption_resolved = 0
+    for idx, m in enumerate(transcript):
+        if m["sender_type"] == "system" and any(word in m["sender_name"].lower() for word in ["whisper", "interrupt", "late", "drop"]):
+            interruption_events += 1
+            next_teacher = None
+            for next_m in transcript[idx+1:]:
+                if next_m["sender_type"] == "teacher":
+                    next_teacher = next_m
+                    break
+            if next_teacher:
+                msg_lower = next_teacher["message_text"].lower()
+                if "[" in msg_lower or any(name.lower() in msg_lower for name in ["vihaan", "ishaan", "kabir", "ananya", "riya", "aarav"]):
+                    interruption_resolved += 1
+                    
+    interruption_score = 10.0 if interruption_events == 0 else (interruption_resolved / interruption_events) * 10.0
+
+    # 4. Encouraged participation (addressing Ananya or Riya)
+    addressed_students = set()
+    for m in teacher_messages:
+        text_lower = m["message_text"].lower()
+        for name in ["Ananya", "Riya"]:
+            if name.lower() in text_lower:
+                addressed_students.add(name)
+                
+    participation_score = 5.0 + len(addressed_students) * 2.5
+
+    # 5. Changed Strategy (blackboard usage or question density)
+    strategy_score = 5.0
+    has_blackboard = any("blackboard" in m["message_text"].lower() or "[" in m["message_text"].lower() for m in teacher_messages)
+    if has_blackboard:
+        strategy_score += 3.0
+    
+    questions_asked = sum(1 for m in teacher_messages if "?" in m["message_text"])
+    if questions_asked >= 3:
+        strategy_score += 2.0
+
+    # Calculate overall adaptability
+    overall_score = round((conf_score + pace_score + interruption_score + participation_score + strategy_score) / 5.0, 1)
+
+    # Formulate feedback text
+    feedbacks = []
+    if conf_score < 7.0:
+        feedbacks.append("Teacher should focus on adjusting explanations more effectively when student confusion increases (e.g., using simpler scaffolding or blackboard drawings).")
+    if interruption_score < 7.0:
+        feedbacks.append("Consider responding more directly to classroom disruptions and whispering using refocus actions.")
+    if participation_score < 7.0:
+        feedbacks.append("Try to actively engage quiet or shy students like Ananya to balance participation.")
+        
+    if not feedbacks:
+        feedbacks.append("Teacher adjusted explanations effectively after confusion increased, managed pacing, and engaged students successfully.")
+        
+    feedback_text = " ".join(feedbacks)
+
+    return {
+        "score": overall_score,
+        "feedback": feedback_text
+    }
+
+
+def _compute_realism_score(
+    transcript: List[Dict[str, str]],
+    student_states: List[StudentState],
+) -> Dict[str, Any]:
+    """
+    Computes a pedagogical and social Realism Score (0-10) and checks for session weaknesses.
+    Factors: behavior diversity, memory consistency, response uniqueness, emotional smoothness, interaction quality.
+    """
+    import math
+    import re
+    from validation import compute_jaccard_similarity
+    
+    student_messages = [m for m in transcript if m["sender_type"] == "student"]
+    teacher_messages = [m for m in transcript if m["sender_type"] == "teacher"]
+    system_messages = [m for m in transcript if m["sender_type"] == "system"]
+    
+    # 1. Diversity Score (Shannon Entropy of speaker turns)
+    speaker_counts = {}
+    for m in student_messages:
+        name = m.get("sender_name", "")
+        speaker_counts[name] = speaker_counts.get(name, 0) + 1
+        
+    counts = list(speaker_counts.values())
+    if counts:
+        total = sum(counts)
+        entropy = 0.0
+        for c in counts:
+            p = c / total
+            entropy -= p * math.log2(p)
+        # Max entropy for 6 students is log2(6) = 2.58
+        div_score = min(10.0, (entropy / 2.58) * 10.0)
+    else:
+        div_score = 5.0
+        
+    # 2. Response Uniqueness (TTR checking)
+    all_words = []
+    for m in student_messages:
+        words = re.findall(r'\w+', m["message_text"].lower())
+        all_words.extend(words)
+        
+    if all_words:
+        ttr = len(set(all_words)) / len(all_words)
+        uniq_score = min(10.0, (ttr / 0.45) * 10.0)
+    else:
+        uniq_score = 5.0
+        
+    # 3. Memory Consistency (checking repetitions)
+    repeat_deductions = 0
+    for i in range(len(student_messages) - 1):
+        t1 = student_messages[i]["message_text"]
+        t2 = student_messages[i+1]["message_text"]
+        if compute_jaccard_similarity(t1, t2) >= 0.8:
+            repeat_deductions += 2.5
+    cons_score = max(0.0, 10.0 - repeat_deductions)
+    
+    # 4. Emotional Smoothness (Standard deviation checks showing individual traits)
+    if student_states:
+        att_vals = [s.attention_level for s in student_states]
+        conf_vals = [s.confusion_level for s in student_states]
+        
+        def std_dev(vals):
+            n = len(vals)
+            if n <= 1:
+                return 0.0
+            mean = sum(vals) / n
+            variance = sum((x - mean) ** 2 for x in vals) / (n - 1)
+            return math.sqrt(variance)
+            
+        att_sd = std_dev(att_vals)
+        conf_sd = std_dev(conf_vals)
+        
+        smooth_score = 10.0
+        if att_sd < 5.0:
+            smooth_score -= 2.0
+        if conf_sd < 5.0:
+            smooth_score -= 2.0
+    else:
+        smooth_score = 7.0
+        
+    # 5. Interaction Quality
+    event_resolved_ratio = 1.0
+    if system_messages:
+        addressed = 0
+        for sys_m in system_messages:
+            sys_text = sys_m["message_text"].lower()
+            for teach_m in teacher_messages:
+                teach_text = teach_m["message_text"].lower()
+                if any(w in teach_text for w in ["focus", "attention", "quiet", "listen", "blackboard"]):
+                    addressed += 1
+                    break
+        event_resolved_ratio = addressed / len(system_messages)
+    qual_score = 5.0 + event_resolved_ratio * 5.0
+    
+    overall_score = round((div_score + uniq_score + cons_score + smooth_score + qual_score) / 5.0, 1)
+    
+    # Compile weaknesses list
+    weaknesses = []
+    if div_score < 7.0:
+        weaknesses.append("A single student dominated the classroom turns, reducing participation diversity.")
+    if uniq_score < 6.0:
+        weaknesses.append("Student vocabulary and sentence structures became repetitive over time.")
+    if cons_score < 8.0:
+        weaknesses.append("Direct response repetitions detected during the session.")
+    if smooth_score < 8.0:
+        weaknesses.append("Student emotional states clustered too closely without realistic individual differences.")
+    if qual_score < 7.0:
+        weaknesses.append("Classroom disruptions and random events were not effectively addressed by the teacher.")
+        
+    if not weaknesses:
+        weaknesses.append("No significant weaknesses detected. The simulation demonstrated highly realistic student behaviors.")
+        
+    return {
+        "score": overall_score,
+        "weaknesses": weaknesses
     }
 
 
@@ -850,6 +1230,12 @@ async def generate_evaluation(
             "transcript_summary": f"Brief introduction for {subject} ({topic}). Teacher established positive rapport.",
         }
 
+    # Compute adaptability score
+    adaptability_res = _compute_adaptability_score(transcript, student_states or [])
+
+    # Compute realism score
+    realism_res = _compute_realism_score(transcript, student_states or [])
+
     # Try LLM cascade for evaluation
     try:
         prompt = f"""You are a B.Ed Teacher Training Assessor. Evaluate this virtual classroom session.
@@ -864,6 +1250,9 @@ Teacher turns: {metrics["teacher_turns"]} | Student turns: {metrics["student_tur
 Teacher speaking: {metrics["teacher_speaking_pct"]}% | Student speaking: {metrics["student_speaking_pct"]}%
 Teacher word count: {metrics["teacher_word_count"]}
 Questions asked by teacher: {metrics["teacher_questions_asked"]}
+Open-ended questions asked: {metrics["teacher_open_questions"]}
+Teacher speech rate: {metrics["teacher_wpm"]} Words Per Minute (WPM)
+Teacher filler words used: {metrics["teacher_filler_count"]}
 Unique students who spoke: {metrics["unique_students_engaged"]}/6
 Students never addressed: {', '.join(metrics["students_never_addressed"]) or 'None — great!'}
 Students addressed by teacher: {', '.join(metrics["students_addressed_by_teacher"]) or 'None'}
@@ -874,6 +1263,12 @@ Avg student understanding: {metrics["avg_student_understanding"]}%
 Most engaged: {metrics["most_engaged_student"]}
 Most confused: {metrics["most_confused_student"]}
 Least engaged: {metrics["least_engaged_student"]}
+
+Teacher Adaptability Score: {adaptability_res["score"]}/10 (calculated from real responses to confusion, adjustments to speaking pace, interruption handling, participation encouragement of quiet/shy students, and strategy switches)
+Teacher Adaptability Feedback: {adaptability_res["feedback"]}
+
+Simulation Realism Score: {realism_res["score"]}/10 (calculated mathematically from turn diversity shannon entropy, response uniqueness vocabulary ratios, consistency checks, emotional smoothness, and event interaction quality)
+Simulation Realism Feedback: {", ".join(realism_res["weaknesses"])}
 
 ═══ TRANSCRIPT ═══
 {transcript_str}
@@ -886,7 +1281,7 @@ Base your scores on the REAL METRICS above, not on feelings:
   {metrics["unique_students_engaged"]}/6 students spoke. {'Students never addressed: ' + ', '.join(metrics["students_never_addressed"]) + ' — deduct for each unengaged student.' if metrics["students_never_addressed"] else 'All students engaged — bonus points!'}
 - Time Management (0-100): Teacher speaking was {metrics["teacher_speaking_pct"]}%.
   Ideal is 40-50% teacher, 50-60% student. Penalize if teacher > 70%.
-- Question Handling (0-100): Teacher asked {metrics["teacher_questions_asked"]} questions.
+- Question Handling (0-100): Teacher asked {metrics["teacher_questions_asked"]} questions ({metrics["teacher_open_questions"]} open-ended).
   Was the teacher patient with confused students? Did they address the most confused student ({metrics["most_confused_student"]})?
 
 Return ONLY raw JSON:
@@ -895,7 +1290,7 @@ Return ONLY raw JSON:
     "engagement_score": integer 0-100,
     "time_management_score": integer 0-100,
     "question_handling_score": integer 0-100,
-    "suggestions": "detailed markdown: strengths, weaknesses, specific B.Ed pedagogical advice with references to actual metrics",
+    "suggestions": "detailed markdown containing sections: Strengths, Weaknesses, Specific B.Ed Pedagogical Advice, a dedicated '### 🎙️ Teacher Speaking Style Analysis' section detailing Speaking Pace ({metrics["teacher_wpm"]} WPM, ideal 120-150 WPM), Filler Word Usage ({metrics["teacher_filler_count"]} count), and Questioning Technique ({metrics["teacher_open_questions"]} open-ended questions asked), a dedicated '### 🛠️ Teacher Adaptability Analysis' presenting the Adaptability Score ({adaptability_res["score"]}/10) and feedback: {adaptability_res["feedback"]}, and a dedicated '### 🔬 Simulation Realism Report' presenting the Realism Score ({realism_res["score"]}/10) and weaknesses: {', '.join(realism_res['weaknesses'])}",
     "transcript_summary": "2-3 sentence factual summary"
 }}"""
 
@@ -961,6 +1356,28 @@ Return ONLY raw JSON:
             f"Student {m['most_confused_student']} was most confused. "
             "Consider using simpler analogies and checking understanding more frequently."
         )
+
+    suggestions_parts.append(
+        f"\n### 🎙️ Teacher Speaking Style Analysis\n"
+        f"- **Speaking Pace:** {m['teacher_wpm']} WPM. "
+        f"{'This is a good, steady pedagogical pace (ideal: 120-150 WPM).' if 120 <= m['teacher_wpm'] <= 150 else ('Your pace is slightly fast (>150 WPM). Try to slow down for better student absorption.' if m['teacher_wpm'] > 150 else 'Your pace is a bit slow (<120 WPM). Injecting more energy can keep the classroom engaged.')}\n"
+        f"- **Filler Word Usage:** {m['teacher_filler_count']} filler words detected. "
+        f"{'Excellent, you spoke very deliberately!' if m['teacher_filler_count'] <= 2 else 'Try to pause deliberately instead of using filler words (um, uh, like).'}\n"
+        f"- **Questioning Technique:** {m['teacher_open_questions']} open-ended questions asked out of {m['teacher_questions_asked']} total questions. "
+        f"{'Great job using open-ended questions to stimulate critical thinking!' if m['teacher_open_questions'] > 1 else 'Try asking more open-ended questions (starting with \"Why\" or \"How\") to engage students deeper.'}"
+    )
+
+    suggestions_parts.append(
+        f"\n### 🛠️ Teacher Adaptability Analysis\n"
+        f"- **Adaptability Score:** {adaptability_res['score']}/10\n"
+        f"- **Feedback:** {adaptability_res['feedback']}"
+    )
+
+    suggestions_parts.append(
+        f"\n### 🔬 Simulation Realism Report\n"
+        f"- **Realism Score:** {realism_res['score']}/10\n"
+        f"- **Weaknesses Checked:**\n" + "\n".join(f"  - {w}" for w in realism_res["weaknesses"])
+    )
 
     suggestions_parts.append(
         "\n**Recommendation:** Aim for 40% teacher talk, 60% student interaction. "

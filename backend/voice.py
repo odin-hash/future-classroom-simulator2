@@ -1,8 +1,11 @@
 import os
 import hashlib
 import asyncio
+import time
 import edge_tts
+from collections import OrderedDict
 from typing import Dict, Any
+
 
 # Resolve absolute paths relative to the backend directory
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -127,16 +130,59 @@ def _detect_script(text: str) -> str:
     return "english"
 
 
-# In-memory TTS Cache to eliminate any file read/write latency and disk dependency
-TTS_CACHE: Dict[str, bytes] = {}
+class TTLCache:
+    """
+    A memory-safe, zero-dependency in-memory cache system combining 
+    Time-To-Live (TTL) expiration and Least-Recently-Used (LRU) eviction boundaries.
+    """
+    def __init__(self, maxsize: int = 500, ttl: float = 1800.0):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self.cache = OrderedDict()  # key -> (value, expiry_timestamp)
+
+    def get(self, key: str):
+        if key not in self.cache:
+            return None
+        value, expiry = self.cache[key]
+        if time.time() > expiry:
+            del self.cache[key]  # Auto-expire
+            return None
+        # Move key to end to maintain LRU access order
+        self.cache.move_to_end(key)
+        return value
+
+    def set(self, key: str, value: any):
+        now = time.time()
+        self.cleanup()
+        if key in self.cache:
+            del self.cache[key]
+        elif len(self.cache) >= self.maxsize:
+            self.cache.popitem(last=False)  # Evict oldest entry (LRU/FIFO)
+        self.cache[key] = (value, now + self.ttl)
+
+    def cleanup(self):
+        """Scans and evicts expired records from memory."""
+        now = time.time()
+        expired = [k for k, (_, exp) in self.cache.items() if now > exp]
+        for k in expired:
+            del self.cache[k]
 
 
-async def generate_speech_audio(text: str, student_name: str, language: str = "English") -> bytes:
+# Instantiate memory-safe controlled TTS Cache (max 500 MP3 audio entries, 30 min duration)
+TTS_CACHE = TTLCache(maxsize=500, ttl=1800.0)
+
+# Global map of asyncio.Locks to prevent cache stampedes
+_pending_tts_locks: Dict[str, asyncio.Lock] = {}
+
+
+async def generate_speech_audio(text: str, student_name: str, language: str = "English") -> tuple[bytes, bool]:
     """
     Main TTS synthesis function.
     Uses Microsoft Edge Neural TTS for natural, human-like voices.
-    Checks the in-memory cache first, then generates new audio bytes asynchronously.
-    Returns raw MP3 audio bytes.
+    Checks the memory-safe in-memory cache first, then generates new audio bytes asynchronously.
+    Uses asyncio.Locks dynamically per text hash to prevent concurrent request stampedes.
+    Wraps synthesis in a 3-attempt exponential backoff retry system for maximum network resilience.
+    Returns raw MP3 audio bytes and a boolean representing whether it was a cache hit.
     """
     clean_text = text.strip()
     if not clean_text:
@@ -161,35 +207,59 @@ async def generate_speech_audio(text: str, student_name: str, language: str = "E
     text_hash = hashlib.md5(hash_payload.encode("utf-8")).hexdigest()
 
     # In-memory Cache hit — return bytes immediately
-    if text_hash in TTS_CACHE:
+    cached_val = TTS_CACHE.get(text_hash)
+    if cached_val is not None:
         print(f"[Edge TTS] In-memory cache hit for '{clean_text[:30]}...'")
-        return TTS_CACHE[text_hash]
+        return cached_val, True
 
-    # Cache miss — synthesize with Edge TTS asynchronously
-    try:
-        print(f"[Edge TTS] Synthesizing asynchronously for {student_name} ({voice}, rate={rate}, pitch={pitch}) -> '{clean_text[:50]}...'")
+    # Ensure a single lock exists for this cache key to block concurrent redundant synthesis
+    if text_hash not in _pending_tts_locks:
+        _pending_tts_locks[text_hash] = asyncio.Lock()
 
-        communicate = edge_tts.Communicate(
-            text=clean_text,
-            voice=voice,
-            rate=rate,
-            pitch=pitch,
-        )
+    async with _pending_tts_locks[text_hash]:
+        # Double check cache within lock boundary to consume newly synthesized results
+        cached_val = TTS_CACHE.get(text_hash)
+        if cached_val is not None:
+            print(f"[Edge TTS] Stampede avoided! Consumed cached bytes for key '{text_hash}'")
+            return cached_val, True
 
-        audio_data = bytearray()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_data.extend(chunk["data"])
+        # Cache miss — synthesize with Edge TTS asynchronously with resilient retry
+        max_retries = 3
+        base_delay = 0.5
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"[Edge TTS] Synthesizing for {student_name} (attempt {attempt}/{max_retries}) -> '{clean_text[:50]}...'")
 
-        audio_bytes = bytes(audio_data)
-        if not audio_bytes:
-            raise ValueError("Synthesized audio data is empty.")
+                communicate = edge_tts.Communicate(
+                    text=clean_text,
+                    voice=voice,
+                    rate=rate,
+                    pitch=pitch,
+                )
 
-        # Cache the bytes in memory
-        TTS_CACHE[text_hash] = audio_bytes
-        print(f"[Edge TTS] Successfully generated in-memory bytes ({len(audio_bytes)} bytes)")
-        return audio_bytes
+                audio_data = bytearray()
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        audio_data.extend(chunk["data"])
 
-    except Exception as e:
-        print(f"[Edge TTS Error] Async synthesis failed: {e}")
-        raise e
+                audio_bytes = bytes(audio_data)
+                if not audio_bytes:
+                    raise ValueError("Synthesized audio data is empty.")
+
+                # Cache the bytes in memory
+                TTS_CACHE.set(text_hash, audio_bytes)
+                print(f"[Edge TTS] Successfully generated bytes in attempt {attempt} ({len(audio_bytes)} bytes)")
+                return audio_bytes, False
+
+            except Exception as e:
+                print(f"[Edge TTS Warning] Attempt {attempt} failed: {e}")
+                if attempt == max_retries:
+                    print("[Edge TTS Error] All retry attempts exhausted. Raising exception.")
+                    raise e
+                
+                # Exponential backoff: 0.5s -> 1.0s -> 2.0s
+                delay = base_delay * (2 ** (attempt - 1))
+                print(f"[Edge TTS] Retrying in {delay:.2f} seconds...")
+                await asyncio.sleep(delay)
+

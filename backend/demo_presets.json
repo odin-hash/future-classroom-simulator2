@@ -1,0 +1,44 @@
+[
+  {
+    "keywords": ["for loop", "definition", "what is a for loop", "introduce"],
+    "student": "Aarav",
+    "response_text": "A for loop in Python is used to repeat a block of code over a sequence, like a list, tuple, or range. It goes through each item one by one automatically!",
+    "emotion": "questioning"
+  },
+  {
+    "keywords": ["range", "how does range work", "range function", "sequence"],
+    "student": "Kabir",
+    "response_text": "The range function generates a sequence of numbers. For example, range(5) starts at 0 and goes up to but doesn't include 5, so it generates 0, 1, 2, 3, and 4. It's super useful for loops!",
+    "emotion": "talking"
+  },
+  {
+    "keywords": ["infinite", "infinite loop", "never stop", "while true"],
+    "student": "Vihaan",
+    "response_text": "Wait, if we do a while loop with a condition that is always true, it runs forever, right? Like an infinite loop? That sounds like it could crash my terminal!",
+    "emotion": "distracted"
+  },
+  {
+    "keywords": ["difference", "while vs for", "compare", "when to use"],
+    "student": "Ananya",
+    "response_text": "Um... from what I understand, we use a for loop when we know the number of iterations beforehand, like over a list. We use a while loop when we want to keep looping until a certain condition changes.",
+    "emotion": "normal"
+  },
+  {
+    "keywords": ["break", "stop loop", "exit", "break statement"],
+    "student": "Ishaan",
+    "response_text": "Oh! The 'break' statement is awesome! It lets us jump completely out of the loop immediately, even if the loop's condition is still true. It just stops everything!",
+    "emotion": "talking"
+  },
+  {
+    "keywords": ["continue", "skip", "next", "continue statement"],
+    "student": "Riya",
+    "response_text": "Teacher, I'm a bit confused about the 'continue' statement. Does it stop the entire loop like 'break', or does it just skip the current item and jump to the next iteration?",
+    "emotion": "confused"
+  },
+  {
+    "keywords": ["default"],
+    "student": "Aarav",
+    "response_text": "Ah, I see! That makes sense, teacher. Can we write a small program to try this out?",
+    "emotion": "normal"
+  }
+]

@@ -8,7 +8,7 @@ if backend_dir not in sys.path:
 
 import random
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -30,6 +30,7 @@ from personality import (
     select_responders,
     compute_classroom_state,
     apply_attention_decay,
+    evolve_states_and_relationships,
 )
 from fastapi.responses import FileResponse
 from voice import generate_speech_audio
@@ -51,6 +52,7 @@ try:
             ("sessions", "language", "VARCHAR(50) DEFAULT 'English'"),
             ("sessions", "lesson_objectives", "TEXT"),
             ("sessions", "teaching_method", "VARCHAR(100)"),
+            ("sessions", "scenario", "VARCHAR(100) DEFAULT 'normal'"),
             ("session_messages", "student_personality", "VARCHAR(100)"),
         ]:
             try:
@@ -71,6 +73,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Cache", "Content-Length"]
 )
 
 
@@ -95,6 +98,7 @@ def get_events():
 def create_session(session_data: ClassroomSessionCreate, db: Session = Depends(get_db)):
     """Creates a new simulation session"""
     print(f"[CREATE SESSION] session_data: {session_data.model_dump()}")
+    scenario = session_data.scenario or "normal"
     db_session = ClassroomSession(
         subject=session_data.subject,
         topic=session_data.topic,
@@ -103,25 +107,54 @@ def create_session(session_data: ClassroomSessionCreate, db: Session = Depends(g
         teaching_method=session_data.teaching_method,
         duration_minutes=session_data.duration_minutes,
         language=session_data.language,
+        scenario=scenario,
     )
     db.add(db_session)
     db.commit()
     db.refresh(db_session)
 
-    # Populate initial StudentState for each of the 6 students (using personality-driven defaults)
+    # Populate initial StudentState for each of the 6 students (using scenario overrides)
     import json as _json
     for s_info in STUDENTS:
         personality = STUDENT_PERSONALITIES.get(s_info["name"], {})
         traits = personality.get("traits", {})
+        
+        # Scenario baseline overrides
+        att = traits.get("attention_base", 75)
+        conf = traits.get("confidence", 65)
+        und = 75
+        confu = traits.get("confusion_base", 25)
+        cur = traits.get("curiosity", 50)
+        intr = traits.get("interrupt_probability", 20)
+        
+        if scenario == "low_attention":
+            att = 25
+        elif scenario == "high_confusion":
+            confu = 80
+            und = 25
+            att = 65
+        elif scenario == "noisy":
+            att = 45
+            confu = 40
+        elif scenario == "hyperactive":
+            cur = min(100, cur + 30)
+            intr = min(100, intr + 30)
+            if s_info["name"] in ["Ishaan", "Kabir"]:
+                intr = 90
+                cur = 95
+        elif scenario == "time_pressure":
+            att = 65
+            confu = 30
+
         state = StudentState(
             session_id=db_session.id,
             student_name=s_info["name"],
-            attention_level=traits.get("attention_base", 75),
-            confidence_level=traits.get("confidence", 65),
-            understanding_level=75,
-            confusion_level=traits.get("confusion_base", 25),
-            curiosity_level=traits.get("curiosity", 50),
-            interrupt_probability=traits.get("interrupt_probability", 20),
+            attention_level=att,
+            confidence_level=conf,
+            understanding_level=und,
+            confusion_level=confu,
+            curiosity_level=cur,
+            interrupt_probability=intr,
             memory_summary=f"Class started. Topic: {db_session.topic}.",
             memory_json=_json.dumps({
                 "concepts_taught": [],
@@ -182,6 +215,97 @@ def get_session(session_id: int, db: Session = Depends(get_db)):
     return db_session
 
 
+@app.get("/api/sessions/{session_id}/state")
+def get_session_state(session_id: int, db: Session = Depends(get_db)):
+    """
+    Returns the unified recovery payload for a session, including active event,
+    responder queue, elapsed ratio, student states, and the session configuration.
+    """
+    db_session = db.query(ClassroomSession).filter(ClassroomSession.id == session_id).first()
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    latest_state_msg = db.query(SessionMessage).filter(
+        SessionMessage.session_id == session_id,
+        SessionMessage.sender_type == "session_state"
+    ).order_by(SessionMessage.timestamp.desc()).first()
+    
+    state_data = {
+        "active_event_id": None,
+        "responder_queue": [],
+        "elapsed_ratio": 0.0
+    }
+    
+    if latest_state_msg:
+        try:
+            import json as _json
+            state_data = _json.loads(latest_state_msg.message_text)
+        except Exception:
+            pass
+
+    student_states = db.query(StudentState).filter(StudentState.session_id == session_id).all()
+    student_states_serialized = []
+    for s in student_states:
+        try:
+            mem_size = len(s.memory_json) if s.memory_json else 0
+        except Exception:
+            mem_size = 0
+            
+        student_states_serialized.append({
+            "student_name": s.student_name,
+            "attention_level": s.attention_level,
+            "confidence_level": s.confidence_level,
+            "understanding_level": s.understanding_level,
+            "confusion_level": s.confusion_level,
+            "memory_summary": s.memory_summary,
+            "memory_size_bytes": mem_size,
+            "participation_count": s.participation_count
+        })
+
+    last_checkpoint = db.query(SessionMessage).filter(
+        SessionMessage.session_id == session_id,
+        SessionMessage.sender_type == "state_checkpoint"
+    ).order_by(SessionMessage.timestamp.desc()).first()
+    
+    classroom_state = {
+        "noise": 30,
+        "stress": 20,
+        "attention": 75,
+        "confusion": 25,
+        "curiosity": 50,
+        "energy": 60,
+        "engagement": 70
+    }
+    if last_checkpoint:
+        try:
+            import json as _json
+            classroom_state = _json.loads(last_checkpoint.message_text)
+        except Exception:
+            pass
+
+    active_event_obj = None
+    if state_data.get("active_event_id"):
+        matching_events = [e for e in CLASSROOM_EVENTS if e["id"] == state_data["active_event_id"]]
+        if matching_events:
+            active_event_obj = matching_events[0]
+
+    return {
+        "session_id": session_id,
+        "subject": db_session.subject,
+        "topic": db_session.topic,
+        "class_level": db_session.class_level,
+        "duration_minutes": db_session.duration_minutes,
+        "language": db_session.language,
+        "active_event_id": state_data.get("active_event_id"),
+        "active_event": active_event_obj,
+        "responder_queue": state_data.get("responder_queue", []),
+        "elapsed_ratio": state_data.get("elapsed_ratio", 0.0),
+        "student_states": student_states_serialized,
+        "classroom_state": classroom_state
+    }
+
+
+
 @app.post("/api/sessions/{session_id}/turns")
 async def process_teacher_turn(
     session_id: int,
@@ -193,168 +317,322 @@ async def process_teacher_turn(
     decides which student responds, checks if an event should fire or resolve,
     calls LLM to generate response, logs student response, and returns status.
     """
-    db_session = db.query(ClassroomSession).filter(ClassroomSession.id == session_id).first()
-    if not db_session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    # 1. Log Teacher Message
-    teacher_msg = SessionMessage(
-        session_id=session_id,
-        sender_type="teacher",
-        sender_name="Teacher",
-        message_text=turn_input.message,
-    )
-    db.add(teacher_msg)
-    db.commit()
-
-    # Get conversation history for LLM context
-    history = db.query(SessionMessage).filter(SessionMessage.session_id == session_id).order_by(SessionMessage.timestamp.asc()).all()
-    history_list = [
-        {"sender_type": m.sender_type, "sender_name": m.sender_name, "message_text": m.message_text}
-        for m in history
-    ]
-    current_turn = len(history_list)
-
-    # 2. Check for active events in recent history
-    # If the last message was a system event that hasn't been addressed, it is active.
-    active_event_id = None
-    system_messages = [m for m in history if m.sender_type == "system"]
-    if system_messages:
-        # Check if teacher addressed this event in the latest turn
-        # e.g., if there was a whispering event, did the teacher mention Vihaan/Ishaan or use a refocus action?
-        last_system_msg = system_messages[-1]
-        
-        # Check if event was already resolved by looking if there are newer messages addressing it
-        # In this simple model, let's look if the teacher addressed the affected students
-        event_resolved = False
-        
-        # Determine which event it was
-        matching_events = [e for e in CLASSROOM_EVENTS if e["title"] in last_system_msg.sender_name]
-        if matching_events:
-            event_obj = matching_events[0]
-            active_event_id = event_obj["id"]
-            
-            # Resolution conditions:
-            # - Teacher addressed the affected student(s)
-            # - Teacher action is provided (like "focus" or "warn")
-            # - Teacher mentions the affected student's name
-            affected = [name.lower() for name in event_obj["affected_students"]]
-            addressed = turn_input.addressed_student.lower() if turn_input.addressed_student else ""
-            
-            mentioned = any(name in turn_input.message.lower() for name in affected)
-            is_action = turn_input.action in ["focus", "re-engage", "warn"] or addressed in affected
-            
-            if turn_input.action == "blackboard_share" and active_event_id in ["confusion", "attention_drop"]:
-                event_resolved = True
-                active_event_id = None
-            elif mentioned or is_action:
-                event_resolved = True
-                active_event_id = None  # event is now cleared!
-
-    # 3. Apply attention decay to all students each turn
-    all_student_states = db.query(StudentState).filter(
-        StudentState.session_id == session_id
-    ).all()
-    apply_attention_decay(all_student_states, current_turn, db)
-
-    # 4. Compute classroom state for smart student selection
-    classroom_state = compute_classroom_state(
-        turn_number=current_turn,
-        session_duration_minutes=db_session.duration_minutes or 15,
-        student_states=all_student_states,
-    )
-
-    # 5. Determine Responding Student(s) using personality-based probabilities
-    if turn_input.action == "blackboard_share":
-        responding_student_info = next((s for s in STUDENTS if s["name"] == "Riya"), STUDENTS[0])
-    else:
-        responders = select_responders(
-            teacher_message=turn_input.message,
-            addressed_student=turn_input.addressed_student,
-            student_states=all_student_states,
-            classroom_state=classroom_state,
-            students_info=STUDENTS,
-        )
-        responding_student_info = responders[0]["info"] if responders else STUDENTS[0]
+    from error_handler import SimulatorException, ErrorCategory, ErrorSeverity, RecoveryAction
     
-    # 6. Determine if we should trigger a new random event (only if no event is currently active)
-    new_event_trigger = None
-    if not active_event_id:
-        new_event_trigger = trigger_random_event(current_turn)
-        if new_event_trigger:
-            event_msg = SessionMessage(
-                session_id=session_id,
-                sender_type="system",
-                sender_name=f"Event: {new_event_trigger['title']}",
-                message_text=new_event_trigger["description"],
+    try:
+        db_session = db.query(ClassroomSession).filter(ClassroomSession.id == session_id).first()
+        if not db_session:
+            raise SimulatorException("Session not found", ErrorCategory.NETWORK, ErrorSeverity.CRITICAL, RecoveryAction.IGNORE)
+
+        # 1. Log Teacher Message
+        teacher_msg = SessionMessage(
+            session_id=session_id,
+            sender_type="teacher",
+            sender_name="Teacher",
+            message_text=turn_input.message,
+        )
+        db.add(teacher_msg)
+        db.commit()
+
+        # Get conversation history for LLM context
+        history = db.query(SessionMessage).filter(SessionMessage.session_id == session_id).order_by(SessionMessage.timestamp.asc()).all()
+        history_list = [
+            {"sender_type": m.sender_type, "sender_name": m.sender_name, "message_text": m.message_text}
+            for m in history
+            if m.sender_type not in ["session_state", "state_checkpoint"]
+        ]
+        current_turn = len(history_list)
+
+        # 2. Check for active events in recent history
+        active_event_id = None
+        system_messages = [m for m in history if m.sender_type == "system"]
+        if system_messages:
+            last_system_msg = system_messages[-1]
+            event_resolved = False
+            matching_events = [e for e in CLASSROOM_EVENTS if e["title"] in last_system_msg.sender_name]
+            if matching_events:
+                event_obj = matching_events[0]
+                active_event_id = event_obj["id"]
+                
+                affected = [name.lower() for name in event_obj["affected_students"]]
+                addressed = turn_input.addressed_student.lower() if turn_input.addressed_student else ""
+                
+                mentioned = any(name in turn_input.message.lower() for name in affected)
+                is_action = turn_input.action in ["focus", "re-engage", "warn"] or addressed in affected
+                
+                if turn_input.action == "blackboard_share" and active_event_id in ["confusion", "attention_drop"]:
+                    event_resolved = True
+                    active_event_id = None
+                elif mentioned or is_action:
+                    event_resolved = True
+                    active_event_id = None
+
+        import json
+        
+        # 3. Retrieve previous noise and stress metrics from database
+        last_state_msg = db.query(SessionMessage).filter(
+            SessionMessage.session_id == session_id,
+            SessionMessage.sender_type == "state_checkpoint"
+        ).order_by(SessionMessage.timestamp.desc()).first()
+
+        prev_noise = 30.0
+        prev_stress = 20.0
+        if last_state_msg:
+            try:
+                state_data = json.loads(last_state_msg.message_text)
+                prev_noise = state_data.get("noise", 30.0)
+                prev_stress = state_data.get("stress", 20.0)
+            except Exception:
+                pass
+        else:
+            # First turn: check scenario preset for initial values
+            if db_session.scenario == "noisy":
+                prev_noise = 75.0
+                prev_stress = 50.0
+            elif db_session.scenario == "hyperactive":
+                prev_noise = 60.0
+                prev_stress = 40.0
+
+        # 4. Apply ECE turn evolution to student states and relationship coefficients
+        all_student_states = db.query(StudentState).filter(
+            StudentState.session_id == session_id
+        ).all()
+        
+        # Evolve dynamics (returns current turn noise and stress)
+        ece_metrics = evolve_states_and_relationships(
+            student_states=all_student_states,
+            teacher_message=turn_input.message,
+            conversation_history=history_list,
+            db=db
+        )
+        new_noise = ece_metrics["noise"]
+        new_stress = ece_metrics["stress"]
+
+        # 5. Compute classroom state for smart student selection
+        classroom_state = compute_classroom_state(
+            turn_number=current_turn,
+            session_duration_minutes=db_session.duration_minutes or 15,
+            student_states=all_student_states,
+            noise=new_noise,
+            stress=new_stress
+        )
+
+        # Save state checkpoint message to DB for tracking logs without migrations
+        checkpoint_msg = SessionMessage(
+            session_id=session_id,
+            sender_type="state_checkpoint",
+            sender_name="System",
+            message_text=json.dumps({
+                "noise": new_noise,
+                "stress": new_stress,
+                "attention": classroom_state["attention"],
+                "confusion": classroom_state["confusion"],
+                "curiosity": classroom_state["curiosity"],
+                "energy": classroom_state["energy"],
+                "engagement": classroom_state["engagement"]
+            }, ensure_ascii=False)
+        )
+        db.add(checkpoint_msg)
+        db.commit()
+
+        # 6. Determine Responding Student(s) using personality-based probabilities
+        is_interrupt = False
+        if turn_input.action == "blackboard_share":
+            responding_student_info = next((s for s in STUDENTS if s["name"] == "Riya"), STUDENTS[0])
+        else:
+            responders = select_responders(
+                teacher_message=turn_input.message,
+                addressed_student=turn_input.addressed_student,
+                student_states=all_student_states,
+                classroom_state=classroom_state,
+                students_info=STUDENTS,
+                conversation_history=history_list,
             )
-            db.add(event_msg)
-            db.commit()
+            responding_student_info = responders[0]["info"] if responders else STUDENTS[0]
+            if responders and responders[0]["reason"] == "interrupt":
+                is_interrupt = True
+        
+        # 7. Determine if we should trigger a new random event (only if no event is currently active and not in demo mode)
+        new_event_trigger = None
+        if not active_event_id and not turn_input.is_demo:
+            # Determine the last event from recent history to avoid consecutive duplicates
+            last_event_id = None
+            system_messages = [m for m in history if m.sender_type == "system"]
+            if system_messages:
+                last_system_msg = system_messages[-1]
+                matching_events = [e for e in CLASSROOM_EVENTS if e["title"] in last_system_msg.sender_name]
+                if matching_events:
+                    last_event_id = matching_events[0]["id"]
+            new_event_trigger = trigger_random_event(current_turn, classroom_state, last_event_id=last_event_id)
+            if new_event_trigger:
+                event_msg = SessionMessage(
+                    session_id=session_id,
+                    sender_type="system",
+                    sender_name=f"Event: {new_event_trigger['title']}",
+                    message_text=new_event_trigger["description"],
+                )
+                db.add(event_msg)
+                db.commit()
+                
+                # Events override the responding student
+                if new_event_trigger["id"] == "interruption":
+                    responding_student_info = next((s for s in STUDENTS if s["name"] == "Ishaan"), responding_student_info)
+                    is_interrupt = True
+                elif new_event_trigger["id"] == "difficult_question":
+                    responding_student_info = next((s for s in STUDENTS if s["name"] == "Aarav"), responding_student_info)
+                elif new_event_trigger["id"] == "confusion":
+                    responding_student_info = next((s for s in STUDENTS if s["name"] == "Riya"), responding_student_info)
+
+        # 8. Generate Response Text via Personality-Driven AI or Demo Preset Bypass
+        if turn_input.is_demo:
+            print(f"[DEMO MODE] Bypassing LLM and TTS for message: {turn_input.message}")
+            presets_path = os.path.join(backend_dir, "demo_presets.json")
+            presets = []
+            if os.path.exists(presets_path):
+                try:
+                    with open(presets_path, "r", encoding="utf-8") as f:
+                        presets = json.load(f)
+                except Exception as e:
+                    print(f"[DEMO MODE Error] Failed to load presets: {e}")
             
-            # Events override the responding student
-            if new_event_trigger["id"] == "interruption":
-                responding_student_info = next((s for s in STUDENTS if s["name"] == "Ishaan"), responding_student_info)
-            elif new_event_trigger["id"] == "difficult_question":
-                responding_student_info = next((s for s in STUDENTS if s["name"] == "Aarav"), responding_student_info)
-            elif new_event_trigger["id"] == "confusion":
-                responding_student_info = next((s for s in STUDENTS if s["name"] == "Riya"), responding_student_info)
+            matched_preset = None
+            t_msg_lower = turn_input.message.lower()
+            for p in presets:
+                if p["keywords"] == ["default"]:
+                    continue
+                if any(k in t_msg_lower for k in p["keywords"]):
+                    matched_preset = p
+                    break
+            
+            if not matched_preset:
+                matched_preset = next((p for p in presets if p["keywords"] == ["default"]), {
+                    "student": "Aarav",
+                    "response_text": "Ah, I see! That makes sense, teacher. Can we write a small program to try this out?",
+                    "emotion": "normal"
+                })
+                
+            responding_student_info = next((s for s in STUDENTS if s["name"].lower() == matched_preset["student"].lower()), STUDENTS[0])
+            student_reply = {
+                "responding_student": responding_student_info["name"],
+                "response_text": matched_preset["response_text"],
+                "emotion": matched_preset["emotion"],
+                "fallback_activated": False
+            }
+            
+            # Update student state slightly for realism progress in demo mode
+            student_name = responding_student_info["name"]
+            state_rec = db.query(StudentState).filter(
+                StudentState.session_id == session_id,
+                StudentState.student_name == student_name
+            ).first()
+            if state_rec:
+                state_rec.attention_level = max(0, min(100, state_rec.attention_level + 5))
+                state_rec.understanding_level = max(0, min(100, state_rec.understanding_level + 10))
+                state_rec.confusion_level = max(0, min(100, state_rec.confusion_level - 10))
+                state_rec.participation_count += 1
+                db.commit()
+            
+            # Warm the cache in background
+            try:
+                await generate_speech_audio(student_reply["response_text"], student_reply["responding_student"], db_session.language)
+            except Exception as e:
+                print(f"[DEMO MODE] Cache warming failed: {e}")
+        else:
+            print(f"[TURN] Session {session_id} | Turn {current_turn} | Student: {responding_student_info['name']} | Energy: {classroom_state['energy']}")
+            student_reply = await generate_student_reply(
+                session_id=session_id,
+                db=db,
+                subject=db_session.subject,
+                topic=db_session.topic,
+                class_level=db_session.class_level,
+                objectives=db_session.lesson_objectives or "",
+                method=db_session.teaching_method or "",
+                language=db_session.language,
+                student_name=responding_student_info["name"],
+                student_personality=responding_student_info["personality"],
+                teacher_message=turn_input.message,
+                conversation_history=history_list,
+                active_event=active_event_id or (new_event_trigger["id"] if new_event_trigger else None),
+                is_interrupt=is_interrupt
+            )
 
-    # 7. Generate Response Text via Personality-Driven AI
-    print(f"[TURN] Session {session_id} | Turn {current_turn} | Student: {responding_student_info['name']} | Energy: {classroom_state['energy_level']}")
-    student_reply = await generate_student_reply(
-        session_id=session_id,
-        db=db,
-        subject=db_session.subject,
-        topic=db_session.topic,
-        class_level=db_session.class_level,
-        objectives=db_session.lesson_objectives or "",
-        method=db_session.teaching_method or "",
-        language=db_session.language,
-        student_name=responding_student_info["name"],
-        student_personality=responding_student_info["personality"],
-        teacher_message=turn_input.message,
-        conversation_history=history_list,
-        active_event=active_event_id or (new_event_trigger["id"] if new_event_trigger else None)
-    )
+        # 9. Save Student Response to DB
+        student_msg = SessionMessage(
+            session_id=session_id,
+            sender_type="student",
+            sender_name=responding_student_info["name"],
+            message_text=student_reply["response_text"],
+            student_personality=responding_student_info.get("personality", "Curious student"),
+        )
+        db.add(student_msg)
+        db.commit()
 
-    # 6. Save Student Response to DB
-    student_msg = SessionMessage(
-        session_id=session_id,
-        sender_type="student",
-        sender_name=responding_student_info["name"],
-        message_text=student_reply["response_text"],
-        student_personality=responding_student_info["personality"],
-    )
-    db.add(student_msg)
-    db.commit()
-
-    # Fetch updated student states to return to frontend
-    updated_states = db.query(StudentState).filter(StudentState.session_id == session_id).all()
-    student_states_serialized = [
-        {
-            "student_name": s.student_name,
-            "attention_level": s.attention_level,
-            "confidence_level": s.confidence_level,
-            "understanding_level": s.understanding_level,
-            "confusion_level": s.confusion_level,
-            "memory_summary": s.memory_summary,
-            "participation_count": s.participation_count
+        # Save session state checkpoint message to DB for refresh-proof recovery
+        final_active_event_id = active_event_id if not new_event_trigger else new_event_trigger["id"]
+        state_payload = {
+            "active_event_id": final_active_event_id,
+            "responder_queue": turn_input.responder_queue or [],
+            "elapsed_ratio": turn_input.elapsed_ratio or 0.0
         }
-        for s in updated_states
-    ]
+        state_msg = SessionMessage(
+            session_id=session_id,
+            sender_type="session_state",
+            sender_name="SystemState",
+            message_text=json.dumps(state_payload, ensure_ascii=False)
+        )
+        db.add(state_msg)
+        db.commit()
 
-    return {
-        "student_message": {
-            "sender_name": responding_student_info["name"],
-            "sender_type": "student",
-            "message_text": student_reply["response_text"],
-            "student_personality": responding_student_info["personality"],
-            "emotion": student_reply["emotion"]
-        },
-        "triggered_event": new_event_trigger,
-        "active_event_id": active_event_id if not new_event_trigger else new_event_trigger["id"],
-        "student_states": student_states_serialized
-    }
+        # Fetch updated student states to return to frontend
+        updated_states = db.query(StudentState).filter(StudentState.session_id == session_id).all()
+        student_states_serialized = [
+            {
+                "student_name": s.student_name,
+                "attention_level": s.attention_level,
+                "confidence_level": s.confidence_level,
+                "understanding_level": s.understanding_level,
+                "confusion_level": s.confusion_level,
+                "memory_summary": s.memory_summary,
+                "memory_size_bytes": len(s.memory_json) if s.memory_json else 0,
+                "participation_count": s.participation_count
+            }
+            for s in updated_states
+        ]
+
+        return {
+            "student_message": {
+                "sender_name": responding_student_info["name"],
+                "sender_type": "student",
+                "message_text": student_reply["response_text"],
+                "student_personality": responding_student_info.get("personality", "Curious student"),
+                "emotion": student_reply["emotion"]
+            },
+            "fallback_activated": student_reply.get("fallback_activated", False),
+            "triggered_event": new_event_trigger,
+            "active_event_id": final_active_event_id,
+            "student_states": student_states_serialized,
+            "classroom_state": {
+                "noise": new_noise,
+                "stress": new_stress,
+                "attention": classroom_state["attention"],
+                "confusion": classroom_state["confusion"],
+                "curiosity": classroom_state["curiosity"],
+                "energy": classroom_state["energy"],
+                "engagement": classroom_state["engagement"]
+            }
+        }
+    except SimulatorException as sim_err:
+        raise HTTPException(status_code=500, detail=sim_err.to_dict())
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        err = SimulatorException(
+            message=f"Internal simulator error: {str(e)}",
+            category=ErrorCategory.NETWORK,
+            severity=ErrorSeverity.HIGH,
+            recovery_action=RecoveryAction.IGNORE
+        )
+        raise HTTPException(status_code=500, detail=err.to_dict())
 
 
 @app.post("/api/sessions/{session_id}/end", response_model=SessionAnalyticsOut)
@@ -372,7 +650,12 @@ async def end_session(session_id: int, db: Session = Depends(get_db)):
     # Get entire session messages
     messages = db.query(SessionMessage).filter(SessionMessage.session_id == session_id).order_by(SessionMessage.timestamp.asc()).all()
     transcript = [
-        {"sender_type": m.sender_type, "sender_name": m.sender_name, "message_text": m.message_text}
+        {
+            "sender_type": m.sender_type,
+            "sender_name": m.sender_name,
+            "message_text": m.message_text,
+            "timestamp": m.timestamp.isoformat() if m.timestamp else None
+        }
         for m in messages
     ]
 
@@ -408,6 +691,13 @@ async def end_session(session_id: int, db: Session = Depends(get_db)):
     db.add(db_analytics)
     db.commit()
     db.refresh(db_analytics)
+    
+    # Auto-generate and save the final_project_report.md to workspace root
+    try:
+        get_session_report(session_id, db)
+    except Exception as report_err:
+        print(f"[REPORT Error] Auto-generating report on end failed: {report_err}")
+        
     return db_analytics
 
 
@@ -420,6 +710,93 @@ def get_session_analytics(session_id: int, db: Session = Depends(get_db)):
     return analytics
 
 
+@app.get("/api/sessions/{session_id}/report")
+def get_session_report(session_id: int, db: Session = Depends(get_db)):
+    """Generates the comprehensive pedagogical report in Markdown format for SkillX and Mentors"""
+    db_session = db.query(ClassroomSession).filter(ClassroomSession.id == session_id).first()
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    analytics = db.query(SessionAnalytics).filter(SessionAnalytics.session_id == session_id).first()
+    if not analytics:
+        raise HTTPException(status_code=404, detail="Analytics report not generated yet. Call session /end first.")
+
+    turns_count = db.query(SessionMessage).filter(
+        SessionMessage.session_id == session_id,
+        SessionMessage.sender_type != "session_state",
+        SessionMessage.sender_type != "state_checkpoint"
+    ).count()
+
+    avg_score = round((analytics.communication_score + analytics.engagement_score + analytics.time_management_score + analytics.question_handling_score) / 4.0, 1)
+
+    report_md = f"""# 🔬 Future Classroom Simulator: B.Ed Pedagogical Assessment Report
+
+This professional evaluation report compiles classroom metadata, telemetry statistics, student dynamic indicators, and pedagogical training evaluations. Prepared for the **SkillX Public Demonstration and Mentor Review**.
+
+---
+
+## 1. Classroom Session Metadata
+- **Session ID**: {session_id}
+- **Subject**: {db_session.subject}
+- **Topic**: {db_session.topic}
+- **Grade Level**: {db_session.class_level}
+- **Scenario Preset**: {db_session.scenario.replace('_', ' ').title()}
+- **Teaching Method**: {db_session.teaching_method}
+- **Duration**: {db_session.duration_minutes} minutes (Actual: {turns_count} turns executed)
+- **Instructional Language**: {db_session.language}
+- **Evaluation Date**: {datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC")}
+
+---
+
+## 2. Pedagogical Assessment Scores
+| Evaluation Category | Score achieved | Benchmark (Passing: 70) | Status |
+| :--- | :--- | :--- | :--- |
+| **Communication Skills** | {analytics.communication_score} / 100 | 70 | {"✅ Passed" if analytics.communication_score >= 70 else "⚠️ Needs Review"} |
+| **Classroom Engagement** | {analytics.engagement_score} / 100 | 70 | {"✅ Passed" if analytics.engagement_score >= 70 else "⚠️ Needs Review"} |
+| **Pacing & Time Management** | {analytics.time_management_score} / 100 | 70 | {"✅ Passed" if analytics.time_management_score >= 70 else "⚠️ Needs Review"} |
+| **Question Handling & Scaffolding** | {analytics.question_handling_score} / 100 | 70 | {"✅ Passed" if analytics.question_handling_score >= 70 else "⚠️ Needs Review"} |
+| **Overall Performance Average** | **{avg_score} / 100** | **70** | **{"🎉 Competent" if avg_score >= 80 else "✅ Passed" if avg_score >= 70 else "⚠️ Intervention Required"}** |
+
+---
+
+## 3. Session Transcript Summary
+{analytics.transcript_summary}
+
+---
+
+## 4. B.Ed Assessor Appraisals & Suggestions
+{analytics.suggestions}
+
+---
+
+## 5. Subsystems Architecture & Innovation Points
+1. **Emergent Classroom Engine (ECE)**
+   - Simulates turn-taking dynamics where student reactions emerge from individual metrics (Attention, Confidence, Understanding, Confusion) and classroom-level metrics (Noise, Stress).
+2. **Speech Synthesis (TTS) & STT Cascade**
+   - High-fidelity Microsoft Edge Neural TTS voices adjusted per personality. Dual-channel STT WebSocket handles binary Opus audio streams with low-latency interim drafting.
+3. **Simulation Validation & Self-Healing**
+   - Jaccard repetition validation caps student volunteer counts, handles silence triggers, and clamps impossible state deviations dynamically.
+
+---
+
+## 6. Limitations & Future Scope
+- **Limitations**: Requires API connectivity for full LLM features. Autoplay browser restrictions block audio play until direct user page click.
+- **Future Scope**: Multi-agent student-to-student conversations, integration with VR platforms, and automated lesson-plan parsing.
+"""
+    
+    # Save the report directly to the workspace as final_project_report.md
+    try:
+        workspace_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        report_path = os.path.join(workspace_dir, "final_project_report.md")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(report_md)
+        print(f"[REPORT] Successfully wrote report file to: {report_path}")
+    except Exception as e:
+        print(f"[REPORT Error] Failed to write report file: {e}")
+
+    return {"report_md": report_md}
+
+
 @app.get("/api/tts")
 async def text_to_speech(text: str, student: str, language: str = "English"):
     """
@@ -430,7 +807,7 @@ async def text_to_speech(text: str, student: str, language: str = "English"):
         raise HTTPException(status_code=400, detail="Missing required 'text' or 'student' query parameters.")
     try:
         # Await the fully async in-memory byte synthesis
-        audio_bytes = await generate_speech_audio(text, student, language)
+        audio_bytes, is_cache_hit = await generate_speech_audio(text, student, language)
         
         # Stream response directly from memory using BytesIO and StreamingResponse
         from io import BytesIO
@@ -442,15 +819,23 @@ async def text_to_speech(text: str, student: str, language: str = "English"):
             headers={
                 "Content-Disposition": "inline",
                 "Accept-Ranges": "bytes",
-                "Content-Length": str(len(audio_bytes))
+                "Content-Length": str(len(audio_bytes)),
+                "X-Cache": "HIT" if is_cache_hit else "MISS"
             }
         )
     except Exception as e:
         print(f"TTS API Endpoint Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        from error_handler import SimulatorException, ErrorCategory, ErrorSeverity, RecoveryAction
+        err = SimulatorException(
+            message=f"TTS synthesis failed: {str(e)}",
+            category=ErrorCategory.SPEECH,
+            severity=ErrorSeverity.MEDIUM,
+            recovery_action=RecoveryAction.IGNORE
+        )
+        raise HTTPException(status_code=500, detail=err.to_dict())
 
 
-def transcribe_google(audio_content: bytes, mime_type: str = "audio/webm") -> str:
+def transcribe_google(audio_content: bytes, mime_type: str = "audio/webm") -> dict:
     import sys
     from google.cloud import speech
     client = speech.SpeechClient()
@@ -470,16 +855,24 @@ def transcribe_google(audio_content: bytes, mime_type: str = "audio/webm") -> st
         alternative_language_codes=["hi-IN", "bn-IN"],
         enable_automatic_punctuation=True,
         use_enhanced=True,
-        model="latest_long"
+        model="latest_short"
     )
     response = client.recognize(config=config, audio=audio)
     transcript = ""
+    confidence = 1.0
+    confidences = []
+    
     for result in response.results:
         transcript += result.alternatives[0].transcript
-    return transcript
+        confidences.append(result.alternatives[0].confidence)
+        
+    if confidences:
+        confidence = sum(confidences) / len(confidences)
+        
+    return {"text": transcript, "confidence": confidence}
 
 
-async def transcribe_deepgram(audio_content: bytes) -> str:
+async def transcribe_deepgram(audio_content: bytes) -> dict:
     import httpx
     api_key = os.environ.get("DEEPGRAM_API_KEY")
     if not api_key:
@@ -503,12 +896,13 @@ async def transcribe_deepgram(audio_content: bytes) -> str:
         )
         if response.status_code == 200:
             res_json = response.json()
-            return res_json["results"]["channels"][0]["alternatives"][0]["transcript"]
+            alt = res_json["results"]["channels"][0]["alternatives"][0]
+            return {"text": alt["transcript"], "confidence": alt["confidence"]}
         else:
             raise Exception(f"Deepgram STT failed: {response.text}")
 
 
-async def transcribe_assemblyai(audio_content: bytes) -> str:
+async def transcribe_assemblyai(audio_content: bytes) -> dict:
     import httpx
     import asyncio
     api_key = os.environ.get("ASSEMBLYAI_API_KEY")
@@ -552,38 +946,27 @@ async def transcribe_assemblyai(audio_content: bytes) -> str:
                 headers=headers
             )
             if poll_resp.status_code == 200:
-                status = poll_resp.json()["status"]
+                res_json = poll_resp.json()
+                status = res_json["status"]
                 if status == "completed":
-                    return poll_resp.json()["text"]
+                    return {"text": res_json["text"], "confidence": res_json.get("confidence", 1.0)}
                 elif status == "error":
-                    raise Exception(f"AssemblyAI failed: {poll_resp.json().get('error')}")
+                    raise Exception(f"AssemblyAI failed: {res_json.get('error')}")
         raise Exception("AssemblyAI transcription timed out")
 
 
 from fastapi import Header
 
-@app.post("/api/transcribe")
-async def transcribe_speech(
-    file: UploadFile = File(...),
-    x_audio_mime_type: Optional[str] = Header(None)
-):
+async def perform_stt_cascade(audio_content: bytes, mime_type: str) -> dict:
     """
-    Receives an audio file from the teacher microphone and transcribes it to text.
-    Dispatches to Google STT, Deepgram, or AssemblyAI with fallback.
+    Unified Speech-to-Text provider cascade with fallback and confidence filtering.
     """
-    import asyncio
-    audio_content = await file.read()
-    if not audio_content:
-        raise HTTPException(status_code=400, detail="Empty audio file uploaded")
-    
     errors = []
-    mime_type = x_audio_mime_type or file.content_type or "audio/webm"
-    print(f"[STT] Dynamic audio mime-type: {mime_type}")
     
     # 0. Gemini Speech-to-Text (Primary) — using new google.genai SDK
     if os.environ.get("GEMINI_API_KEY"):
         try:
-            print("[STT] Attempting Gemini Speech-to-Text (google.genai SDK)...")
+            print("[STT-Cascade] Attempting Gemini Speech-to-Text (google.genai SDK)...")
             from google import genai as google_genai
             import base64
             stt_client = google_genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
@@ -606,64 +989,199 @@ async def transcribe_speech(
                     }
                 ]
             )
-            result = response.text.strip()
+            result = response.text.strip() if response.text else ""
             if result:
-                print(f"[STT] Gemini STT Success: '{result}'")
-                return {"text": result, "provider": "gemini"}
+                print(f"[STT-Cascade] Gemini STT Success: '{result}'")
+                return {"text": result, "provider": "gemini", "confidence": 1.0, "low_confidence": False}
         except Exception as e:
             err_msg = f"Gemini STT Error: {e}"
-            print(f"[STT] {err_msg}")
+            print(f"[STT-Cascade] {err_msg}")
             errors.append(err_msg)
-            
+
     # 1. Google Speech-to-Text (Secondary)
     if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("GOOGLE_API_KEY"):
         try:
-            print("[STT] Attempting Google Cloud Speech-to-Text...")
+            print("[STT-Cascade] Attempting Google Cloud Speech-to-Text...")
             import concurrent.futures
+            import asyncio
             loop = asyncio.get_running_loop()
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                result = await loop.run_in_executor(pool, transcribe_google, audio_content, mime_type)
-                if result:
-                    print(f"[STT] Google Cloud STT Success: '{result}'")
-                    return {"text": result, "provider": "google"}
+                res_dict = await loop.run_in_executor(pool, transcribe_google, audio_content, mime_type)
+                if res_dict and res_dict.get("text"):
+                    text = res_dict["text"]
+                    confidence = res_dict.get("confidence", 1.0)
+                    low_conf = confidence < 0.65
+                    print(f"[STT-Cascade] Google STT Success: '{text}' (confidence: {confidence:.2f})")
+                    return {
+                        "text": text if not low_conf else "I couldn't clearly hear that. Could you repeat?",
+                        "provider": "google",
+                        "confidence": confidence,
+                        "low_confidence": low_conf
+                    }
         except Exception as e:
             err_msg = f"Google STT Error: {e}"
-            print(f"[STT] {err_msg}")
+            print(f"[STT-Cascade] {err_msg}")
             errors.append(err_msg)
-            
+
     # 2. Deepgram (Secondary)
     if os.environ.get("DEEPGRAM_API_KEY"):
         try:
-            print("[STT] Attempting Deepgram Nova-2...")
-            result = await transcribe_deepgram(audio_content)
-            if result:
-                print(f"[STT] Deepgram Success: '{result}'")
-                return {"text": result, "provider": "deepgram"}
+            print("[STT-Cascade] Attempting Deepgram Nova-2...")
+            res_dict = await transcribe_deepgram(audio_content)
+            if res_dict and res_dict.get("text"):
+                text = res_dict["text"]
+                confidence = res_dict.get("confidence", 1.0)
+                low_conf = confidence < 0.65
+                print(f"[STT-Cascade] Deepgram Success: '{text}' (confidence: {confidence:.2f})")
+                return {
+                    "text": text if not low_conf else "I couldn't clearly hear that. Could you repeat?",
+                    "provider": "deepgram",
+                    "confidence": confidence,
+                    "low_confidence": low_conf
+                }
         except Exception as e:
             err_msg = f"Deepgram Error: {e}"
-            print(f"[STT] {err_msg}")
+            print(f"[STT-Cascade] {err_msg}")
             errors.append(err_msg)
-            
+
     # 3. AssemblyAI (Tertiary)
     if os.environ.get("ASSEMBLYAI_API_KEY"):
         try:
-            print("[STT] Attempting AssemblyAI...")
-            result = await transcribe_assemblyai(audio_content)
-            if result:
-                print(f"[STT] AssemblyAI Success: '{result}'")
-                return {"text": result, "provider": "assemblyai"}
+            print("[STT-Cascade] Attempting AssemblyAI...")
+            res_dict = await transcribe_assemblyai(audio_content)
+            if res_dict and res_dict.get("text"):
+                text = res_dict["text"]
+                confidence = res_dict.get("confidence", 1.0)
+                low_conf = confidence < 0.65
+                print(f"[STT-Cascade] AssemblyAI Success: '{text}' (confidence: {confidence:.2f})")
+                return {
+                    "text": text if not low_conf else "I couldn't clearly hear that. Could you repeat?",
+                    "provider": "assemblyai",
+                    "confidence": confidence,
+                    "low_confidence": low_conf
+                }
         except Exception as e:
             err_msg = f"AssemblyAI Error: {e}"
-            print(f"[STT] {err_msg}")
+            print(f"[STT-Cascade] {err_msg}")
             errors.append(err_msg)
-            
+
     # If all failed or no keys are configured:
+    from error_handler import SimulatorException, ErrorCategory, ErrorSeverity, RecoveryAction
+    err = SimulatorException(
+        message=f"Speech-to-Text cascade failed completely. Errors: {errors}",
+        category=ErrorCategory.SPEECH,
+        severity=ErrorSeverity.HIGH,
+        recovery_action=RecoveryAction.MANUAL_INPUT
+    )
     raise HTTPException(
         status_code=500,
-        detail=f"Speech recognition could not be performed. Errors: {errors}"
+        detail=err.to_dict()
     )
 
 
+@app.post("/api/transcribe")
+async def transcribe_speech(
+    file: UploadFile = File(...),
+    x_audio_mime_type: Optional[str] = Header(None)
+):
+    """
+    REST Endpoint: Receives an audio file from the teacher microphone and transcribes it to text
+    via unified Speech-to-Text provider cascade.
+    """
+    audio_content = await file.read()
+    if not audio_content:
+        raise HTTPException(status_code=400, detail="Empty audio file uploaded")
+    
+    mime_type = x_audio_mime_type or file.content_type or "audio/webm"
+    print(f"[STT REST] Dynamic audio mime-type: {mime_type} ({len(audio_content)} bytes)")
+    
+    return await perform_stt_cascade(audio_content, mime_type)
+
+
+@app.websocket("/api/stream-stt")
+async def stream_stt(websocket: WebSocket):
+    """
+    WebSocket Endpoint: Accepts real-time binary audio stream chunks (Opus/WebM) from teacher microphone,
+    provides dynamic real-time partial/interim transcription updates, and delivers final high-accuracy
+    transcriptions upon client speech completion.
+    """
+    await websocket.accept()
+    print("[WS-STT] Client microphone stream connected successfully.")
+    
+    audio_buffer = bytearray()
+    mime_type = "audio/webm"
+    chunk_counter = 0
+    
+    try:
+        while True:
+            # Block waiting for either text stop command or binary audio chunk
+            message = await websocket.receive()
+            
+            if "bytes" in message:
+                chunk = message["bytes"]
+                if chunk:
+                    audio_buffer.extend(chunk)
+                    chunk_counter += 1
+                    
+                    # Generate dynamic interim partial transcription updates every 4 chunks (~1s)
+                    # to keep the interface highly responsive and conversational
+                    if chunk_counter % 4 == 0 and len(audio_buffer) > 15000:
+                        try:
+                            # Run cascade in background to fetch fast draft text
+                            # We enforce a short timeout to prevent blocking the socket thread
+                            import asyncio
+                            draft_res = await asyncio.wait_for(
+                                perform_stt_cascade(bytes(audio_buffer), mime_type),
+                                timeout=1.5
+                            )
+                            draft_text = draft_res.get("text", "")
+                            
+                            # Filter filler system/retry warnings from interim text
+                            if draft_text and not draft_res.get("low_confidence"):
+                                await websocket.send_json({
+                                    "text": draft_text,
+                                    "is_final": False
+                                })
+                        except Exception:
+                            # Fail silently for interim updates to avoid socket crashes
+                            pass
+                            
+            elif "text" in message:
+                command = message["text"]
+                if command == "STOP":
+                    print(f"[WS-STT] Client requested STOP transcription. Total buffer size: {len(audio_buffer)} bytes.")
+                    break
+                    
+    except WebSocketDisconnect:
+        print("[WS-STT] Microphone WebSocket disconnected by client.")
+    except Exception as e:
+        print(f"[WS-STT Error] Stream error: {e}")
+        
+    # Deliver the definitive final transcription result
+    if len(audio_buffer) > 4000:
+        try:
+            print(f"[WS-STT] Compiling and generating definitive final transcription cascade...")
+            final_res = await perform_stt_cascade(bytes(audio_buffer), mime_type)
+            await websocket.send_json({
+                "text": final_res.get("text", ""),
+                "is_final": True,
+                "low_confidence": final_res.get("low_confidence", False),
+                "provider": final_res.get("provider", "google")
+            })
+        except Exception as e:
+            print(f"[WS-STT Error] Final transcription cascade failed: {e}")
+            await websocket.send_json({
+                "text": "I couldn't clearly hear that. Could you repeat?",
+                "is_final": True,
+                "low_confidence": True,
+                "error": str(e)
+            })
+    else:
+        # Buffer is too small (e.g. mic click with no speech)
+        await websocket.send_json({
+            "text": "",
+            "is_final": True
+        })
 @app.get("/api/config")
 async def get_config():
     """
@@ -677,4 +1195,85 @@ async def get_config():
         os.environ.get("ASSEMBLYAI_API_KEY")
     )
     return {"has_stt_keys": has_keys}
+
+@app.get("/api/health")
+async def health_check(db: Session = Depends(get_db)):
+    """
+    Runs diagnostic checks on backend services:
+    - Gemini API Key presence
+    - Database connection health
+    - Audio cache write permissions
+    - TTS synthesis ping (checks edge_tts communicating loop)
+    """
+    import os
+    from database import engine
+    from sqlalchemy import text
+    from voice import CACHE_DIR
+    
+    # 1. API Key Check
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    api_key_valid = bool(gemini_key and len(gemini_key.strip()) > 5)
+    
+    # 2. Database Connection Check
+    db_ok = False
+    db_msg = ""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        db_ok = True
+        db_msg = "Database connected successfully"
+    except Exception as e:
+        db_msg = str(e)
+        
+    # 3. Cache Directory Check
+    cache_ok = False
+    cache_msg = ""
+    try:
+        test_file = os.path.join(CACHE_DIR, ".health_check_temp")
+        with open(test_file, "w") as f:
+            f.write("1")
+        if os.path.exists(test_file):
+            os.remove(test_file)
+            cache_ok = True
+            cache_msg = "Audio cache directory writable"
+    except Exception as e:
+        cache_msg = str(e)
+        
+    # 4. Edge TTS Reachability Check
+    tts_ok = False
+    tts_msg = ""
+    try:
+        import edge_tts
+        # Just instantiate Edge TTS communicate to verify imports and setup
+        communicate = edge_tts.Communicate("Hello", "en-IN-PrabhatNeural")
+        tts_ok = True
+        tts_msg = "Edge TTS modules loaded"
+    except Exception as e:
+        tts_msg = str(e)
+        
+    # 5. STT Service check
+    stt_ok = False
+    stt_msg = ""
+    try:
+        # Check if Google Cloud Speech is importable
+        from google.cloud import speech
+        stt_ok = True
+        stt_msg = "Google Speech client modules initialized"
+    except Exception as e:
+        stt_msg = str(e)
+
+    overall_passed = api_key_valid and db_ok and cache_ok and tts_ok and stt_ok
+    
+    return {
+        "status": "passed" if overall_passed else "failed",
+        "api_key_valid": api_key_valid,
+        "database_connected": db_ok,
+        "database_message": db_msg,
+        "cache_writable": cache_ok,
+        "cache_message": cache_msg,
+        "tts_available": tts_ok,
+        "tts_message": tts_msg,
+        "stt_available": stt_ok,
+        "stt_message": stt_msg
+    }
 

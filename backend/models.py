@@ -16,6 +16,7 @@ class ClassroomSession(Base):
     teaching_method = Column(String, nullable=True)
     duration_minutes = Column(Integer, default=15)
     language = Column(String, default="English") # English, Hindi, Bengali
+    scenario = Column(String, default="normal") # normal, low_attention, high_confusion, noisy, hyperactive, time_pressure
     created_at = Column(DateTime, default=datetime.utcnow)
 
     messages = relationship("SessionMessage", back_populates="session", cascade="all, delete-orphan")

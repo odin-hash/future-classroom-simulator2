@@ -31,6 +31,7 @@ class ClassroomSessionBase(BaseModel):
     teaching_method: Optional[str] = None
     duration_minutes: int = 15
     language: str = "English"  # English, Hindi, Bengali
+    scenario: str = "normal"  # normal, low_attention, high_confusion, noisy, hyperactive, time_pressure
 
 
 class StudentStateBase(BaseModel):
@@ -94,3 +95,9 @@ class TeacherTurnInput(BaseModel):
     message: str
     addressed_student: Optional[str] = None  # Name of student specifically addressed, if any
     action: Optional[str] = None  # Action to perform, e.g., "focus", "explain_basic", etc.
+    active_event_id: Optional[str] = None
+    responder_queue: Optional[str] = None
+    elapsed_ratio: Optional[float] = None
+    is_demo: Optional[bool] = False
+
+

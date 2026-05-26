@@ -1,7 +1,9 @@
-# Python virtual environment
+# Virtual Environments
 venv/
 .venv/
 env/
+node_modules/
+frontend/node_modules/
 
 # Python caches and bytecode
 __pycache__/
@@ -10,29 +12,41 @@ __pycache__/
 *.pyd
 .pytest_cache/
 
-# Local SQLite DB
+# SQLite Database Files
 classroom.db
 classroom.db-journal
+classroom_stress_test.db
+classroom_stress_test.db-journal
 
-# Node dependencies and build
-frontend/node_modules/
+# Compilation & Builds
+dist/
+build/
 frontend/dist/
 frontend/dist-ssr/
 
-# Environment files
+# Environment Secrets & Credentials
 .env
 .env.local
 .env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+credentials.json
+service-account.json
 
-# Logs
+# Audio Files & Caches
+audio_cache/
+backend/audio_cache/
+*.mp3
+*.wav
+
+# Logs & Test Artifacts
 *.log
 logs/
+stress_test_results.json
 
 # Editor and OS metadata
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-
-# TTS audio cache
-backend/audio_cache/

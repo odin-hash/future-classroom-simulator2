@@ -29,6 +29,12 @@ export const Avatar: React.FC<AvatarProps> = ({ style, emotion, name }) => {
     animationClass = 'avatar-sleeping';
   } else if (emotion === 'distracted') {
     animationClass = 'avatar-distracted';
+  } else if (emotion === 'confused') {
+    animationClass = 'avatar-confused';
+  } else if (emotion === 'questioning') {
+    animationClass = 'avatar-questioning';
+  } else if (studentKey === 'ananya' || style === 'shy-girl') {
+    animationClass = 'avatar-shy';
   }
 
   return (

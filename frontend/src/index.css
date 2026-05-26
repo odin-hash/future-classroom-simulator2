@@ -2593,5 +2593,35 @@ body {
   transform: scale(1.25);
 }
 
+/* CSS Micro Expressions & Subtle Transitions */
+.avatar-confused {
+  animation: head-tilt 4s ease-in-out infinite;
+}
 
+.avatar-questioning {
+  animation: lean-forward 3.5s ease-in-out infinite;
+}
 
+.avatar-shy {
+  animation: shy-peek 5s ease-in-out infinite;
+}
+
+@keyframes head-tilt {
+  0% { transform: rotate(0deg) translateY(0); }
+  35% { transform: rotate(4deg) translateY(-1px); }
+  70% { transform: rotate(-3deg) translateY(-2px); }
+  100% { transform: rotate(0deg) translateY(0); }
+}
+
+@keyframes lean-forward {
+  0% { transform: scale(1) translateY(0); }
+  50% { transform: scale(1.05) translateY(-3px); }
+  100% { transform: scale(1) translateY(0); }
+}
+
+@keyframes shy-peek {
+  0% { transform: rotate(0deg) translateX(0); }
+  30% { transform: rotate(-4deg) translateX(-3px) scale(0.97); }
+  70% { transform: rotate(2deg) translateX(1px); }
+  100% { transform: rotate(0deg) translateX(0); }
+}

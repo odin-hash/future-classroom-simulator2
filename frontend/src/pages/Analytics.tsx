@@ -104,6 +104,27 @@ export const Analytics: React.FC<AnalyticsProps> = ({
     });
   };
 
+  const downloadReport = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}/report`);
+      if (res.ok) {
+        const data = await res.json();
+        const element = document.createElement("a");
+        const file = new Blob([data.report_md], { type: 'text/markdown' });
+        element.href = URL.createObjectURL(file);
+        element.download = `SkillX_Pedagogical_Report_Session_${sessionId}.md`;
+        document.body.appendChild(element);
+        element.click();
+        document.body.removeChild(element);
+      } else {
+        alert("Failed to download report.");
+      }
+    } catch (e) {
+      console.error(e);
+      alert("Error downloading report.");
+    }
+  };
+
   if (isLoading) {
     return (
       <div style={{ textAlign: 'center', padding: '5rem', color: 'var(--text-muted)' }}>
@@ -140,20 +161,31 @@ export const Analytics: React.FC<AnalyticsProps> = ({
           </p>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
-          <div style={{ textAlign: 'right' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+          <div style={{ textAlign: 'right', marginRight: '1rem' }}>
             <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{t.overallScore}</span>
-            <h2 style={{ fontSize: '2.5rem', fontWeight: 800, color: 'var(--color-success)' }}>
+            <h2 style={{ fontSize: '2.5rem', fontWeight: 800, color: 'var(--color-success)', lineHeight: 1 }}>
               {averageScore}/100
             </h2>
           </div>
+          <button
+            className="btn-secondary"
+            onClick={downloadReport}
+            style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', border: '1px solid var(--border-card)', padding: '0.75rem 1rem', borderRadius: '12px' }}
+            id="analytics-btn-download-report"
+            type="button"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+            Download Report
+          </button>
           <button 
             className="btn-primary" 
             onClick={onBackToDashboard}
             id="analytics-btn-back"
-            style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}
+            style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', padding: '0.75rem 1.25rem' }}
+            type="button"
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="19" x2="5" y1="12" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="19" x2="5" y1="12" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
             {t.backBtn}
           </button>
         </div>

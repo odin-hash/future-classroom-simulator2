@@ -23,11 +23,12 @@ interface Student {
 }
 
 interface Message {
-  id?: number;
+  id?: number | string;
   sender_type: 'teacher' | 'student' | 'system';
   sender_name: string;
   message_text: string;
   student_personality?: string;
+  timestamp?: string;
 }
 
 interface EventDetail {
@@ -80,11 +81,14 @@ export const Classroom: React.FC<ClassroomProps> = ({
   // STT configuration and Native SpeechRecognition Fallback
   const [hasSttKeys, setHasSttKeys] = useState<boolean>(true);
   const recognitionRef = useRef<any>(null);
+  const adviceShownHistoryRef = useRef<Record<string, number>>({});
 
   // Audio queue and volume states for premium neural voice playback
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(0.85);
-  const audioQueueRef = useRef<{ text: string; studentName: string; emotion: string }[]>([]);
+  const audioQueueRef = useRef<{ text: string; studentName: string; emotion: string; priority: number; seq: number }[]>([]);
+  const audioQueueSequenceRef = useRef<number>(0);
+  const currentPlayingItemRef = useRef<{ text: string; studentName: string; emotion: string; priority: number; seq: number } | null>(null);
   const isAudioPlayingRef = useRef(false);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const originalEmotionsRef = useRef<Record<string, string>>({});
@@ -104,40 +108,118 @@ export const Classroom: React.FC<ClassroomProps> = ({
   const silenceStartRef = useRef<number | null>(null);
   const isRecordingRef = useRef(false);
 
+  // WebSocket Streaming STT and Performance Latency States/Refs
+  const [interimText, setInterimText] = useState('');
+  const wsRef = useRef<WebSocket | null>(null);
+  const sttStartTimeRef = useRef<number>(0);
+  const [isLatencyOpen, setIsLatencyOpen] = useState(false);
+  const [latencyLogs, setLatencyLogs] = useState<{
+    stt: number;
+    llm: number;
+    tts: number;
+    queue: number;
+    history: { type: string; duration: number; timestamp: string }[];
+  }>({
+    stt: 0,
+    llm: 0,
+    tts: 0,
+    queue: 0,
+    history: []
+  });
+
+  // Emergent Classroom Engine (ECE) State
+  const [classroomState, setClassroomState] = useState({
+    noise: 30,
+    stress: 20,
+    attention: 75,
+    confusion: 25,
+    curiosity: 50,
+    energy: 60,
+    engagement: 70
+  });
+
+  const logLatency = (type: 'stt' | 'llm' | 'tts' | 'queue', duration: number) => {
+    setLatencyLogs((prev) => {
+      const newHistory = [
+        { type: type.toUpperCase(), duration, timestamp: new Date().toLocaleTimeString() },
+        ...prev.history
+      ].slice(0, 8); // Keep last 8 entries
+      return {
+        ...prev,
+        [type]: duration,
+        history: newHistory
+      };
+    });
+  };
+
   // 1. Fetch Session Info & Students list
   useEffect(() => {
-    // Get students list
-    fetch(`${API_BASE_URL}/api/students`)
-      .then((res) => res.json())
-      .then((data) => {
-        setStudents(data);
-        // Initialize all student emotions to normal
+    const fetchSessionData = async () => {
+      try {
+        // Fetch config
+        fetch(`${API_BASE_URL}/api/config`)
+          .then((res) => res.json())
+          .then((data) => setHasSttKeys(!!data.has_stt_keys))
+          .catch((err) => {
+            console.warn("Failed to fetch API config, defaulting to server transcription:", err);
+            setHasSttKeys(true);
+          });
+
+        // Fetch students
+        const studentsRes = await fetch(`${API_BASE_URL}/api/students`);
+        const studentsData = await studentsRes.json();
+        setStudents(studentsData);
+
+        // Fetch base session details (contains chat messages)
+        const sessionRes = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}`);
+        const sessionData = await sessionRes.json();
+        setSessionDetails(sessionData);
+        
+        const allMsgs = sessionData.messages || [];
+        const chatMsgs = allMsgs.filter((m: any) => m.sender_type !== 'state_checkpoint' && m.sender_type !== 'session_state');
+        setMessages(chatMsgs);
+        setTimeLeft(sessionData.duration_minutes * 60);
+
+        // Fetch unified recovery state
+        const stateRes = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}/state`);
+        const stateData = await stateRes.json();
+
+        // Restore classroom state
+        if (stateData.classroom_state) {
+          setClassroomState(stateData.classroom_state);
+        }
+
+        // Restore active event
+        if (stateData.active_event) {
+          setActiveEvent(stateData.active_event);
+        }
+
+        // Reconcile student emotions
         const emotions: Record<string, string> = {};
-        data.forEach((s: Student) => {
-          emotions[s.name] = 'normal';
+        studentsData.forEach((s: Student) => {
+          emotions[s.name] = 'normal'; // default
         });
+        
+        // Re-apply event-driven emotions if an event is active
+        if (stateData.active_event) {
+          stateData.active_event.affected_students.forEach((name: string) => {
+            if (stateData.active_event.id === 'attention_drop') emotions[name] = 'sleeping';
+            else if (stateData.active_event.id === 'confusion') emotions[name] = 'confused';
+            else if (stateData.active_event.id === 'whispering') emotions[name] = 'distracted';
+            else if (stateData.active_event.id === 'interruption') emotions[name] = 'talking';
+            else emotions[name] = 'distracted';
+          });
+        }
         setStudentEmotions(emotions);
-      });
 
-    // Get specific session configuration
-    fetch(`${API_BASE_URL}/api/sessions/${sessionId}`)
-      .then((res) => res.json())
-      .then((data) => {
-        setSessionDetails(data);
-        setMessages(data.messages || []);
-        setTimeLeft(data.duration_minutes * 60);
-      });
-
-    // Fetch STT keys availability configuration
-    fetch(`${API_BASE_URL}/api/config`)
-      .then((res) => res.json())
-      .then((data) => {
-        setHasSttKeys(!!data.has_stt_keys);
-      })
-      .catch((err) => {
-        console.warn("Failed to fetch API config, defaulting to server transcription:", err);
-        setHasSttKeys(true);
-      });
+        // Optional: you can restore elapsed_ratio time here if desired
+        // but skipping since client-side handles time locally for now.
+      } catch (err) {
+        console.error("Failed to fetch session setup:", err);
+      }
+    };
+    
+    fetchSessionData();
   }, [sessionId]);
 
   // 2. Ticking Countdown Timer
@@ -225,26 +307,36 @@ export const Classroom: React.FC<ClassroomProps> = ({
     };
   }, [language, hasSttKeys]);
 
-  // iOS Safari touch audio context & SpeechSynthesis unlocker
+  // Unified Web Audio API standard browser context unlocker (resolves iOS/macOS Safari strict gestures)
   useEffect(() => {
-    const unlockAudio = () => {
-      // 1. Unlock web audio / new Audio()
-      const contextClass = (window.AudioContext || (window as any).webkitAudioContext);
-      if (contextClass) {
+    const unlockAudio = async () => {
+      console.info("[Web Audio API] User gesture detected. Unlocking AudioContext...");
+      
+      // 1. Initialize and resume a persistent global AudioContext
+      const AudioContextClass = (window.AudioContext || (window as any).webkitAudioContext);
+      if (AudioContextClass) {
         try {
-          const ctx = new contextClass();
+          if (!audioContextRef.current) {
+            audioContextRef.current = new AudioContextClass();
+          }
+          const ctx = audioContextRef.current;
+          if (ctx.state === 'suspended') {
+            await ctx.resume();
+            console.info("[Web Audio API] Global AudioContext successfully resumed!");
+          }
+          
+          // Generate a brief silent sine-wave buffer for browser capability verification
           const buffer = ctx.createBuffer(1, 1, 22050);
           const source = ctx.createBufferSource();
           source.buffer = buffer;
           source.connect(ctx.destination);
           source.start(0);
-          ctx.resume();
         } catch (e) {
-          console.warn("[AudioContext Unlock] Failed:", e);
+          console.warn("[Web Audio API] Global AudioContext unlock failed:", e);
         }
       }
       
-      // 2. Unlock SpeechSynthesis
+      // 2. Unlock SpeechSynthesis for mobile/iOS fallbacks
       if ('speechSynthesis' in window) {
         try {
           const u = new SpeechSynthesisUtterance('');
@@ -256,19 +348,7 @@ export const Classroom: React.FC<ClassroomProps> = ({
         }
       }
       
-      // 3. Unlock HTML5 Audio() autoplay
-      try {
-        const silentMp3 = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAAA";
-        const unlockAudioObj = new Audio(silentMp3);
-        unlockAudioObj.volume = 0;
-        unlockAudioObj.play()
-          .then(() => console.info("[HTML5 Audio Autoplay Unlock] HTML5 Audio successfully unlocked!"))
-          .catch((err) => console.warn("[HTML5 Audio Autoplay Unlock] Play rejected:", err));
-      } catch (err) {
-        console.warn("[HTML5 Audio Autoplay Unlock] Failed:", err);
-      }
-      
-      // Remove listeners after first run
+      // Unregister event listeners to ensure this runs once only
       window.removeEventListener('click', unlockAudio);
       window.removeEventListener('touchstart', unlockAudio);
     };
@@ -282,13 +362,64 @@ export const Classroom: React.FC<ClassroomProps> = ({
     };
   }, []);
 
-  // 5. Text-To-Speech (TTS) Voice Handler with Queuing & Piper Backend Support
+  // 5. Text-To-Speech (TTS) Voice Handler with Sequence-Stable Preemptive Priority Queueing
   const speakStudentResponse = (text: string, studentName: string, emotion: string) => {
-    // Queue the spoken item
-    audioQueueRef.current.push({ text, studentName, emotion });
-    
-    // If not already playing, start the playback process immediately
-    if (!isAudioPlayingRef.current) {
+    // 1. Determine priority level based on speaker
+    let priority = 40; // Default normal student
+    const lowerName = studentName.toLowerCase();
+    if (lowerName === "teacher" || lowerName === "system") {
+      priority = 100;
+    } else if (lowerName === "ishaan") {
+      priority = 70;
+    } else if (lowerName === "system_event" || lowerName === "event") {
+      priority = 10;
+    }
+
+    // Get sequence sequence index for stable FCFS sorting of equal priorities
+    const seq = audioQueueSequenceRef.current++;
+    const newItem = { text, studentName, emotion, priority, seq, creationTime: Date.now() };
+
+    let isInterrupted = false;
+
+    // 2. Perform Preemptive Interruption if new item has HIGHER priority than current speaker
+    if (isAudioPlayingRef.current && currentPlayingItemRef.current) {
+      if (priority > currentPlayingItemRef.current.priority) {
+        console.info(`[Preemptive Queue] Interruption! Higher priority ${studentName} (${priority}) interrupts ${currentPlayingItemRef.current.studentName} (${currentPlayingItemRef.current.priority})`);
+        
+        // Cleanly pause the active audio object and detach callbacks to prevent standard error fallbacks
+        if (currentAudioRef.current) {
+          currentAudioRef.current.onended = null;
+          currentAudioRef.current.onerror = null;
+          try {
+            currentAudioRef.current.pause();
+          } catch (e) {}
+          currentAudioRef.current = null;
+        }
+
+        // Restore the visual emotion state of the interrupted student
+        const interruptedName = currentPlayingItemRef.current.studentName;
+        setStudentEmotions((prev) => {
+          const restored = { ...prev };
+          restored[interruptedName] = originalEmotionsRef.current[interruptedName] || 'normal';
+          return restored;
+        });
+
+        // Push the interrupted speaker back into the queue to be played/resumed later
+        audioQueueRef.current.push(currentPlayingItemRef.current);
+        
+        // Reset flags and trigger reload
+        isAudioPlayingRef.current = false;
+        currentPlayingItemRef.current = null;
+        isInterrupted = true;
+      }
+    }
+
+    // 3. Push and stable sort descending by priority, ascending by sequence sequence
+    audioQueueRef.current.push(newItem);
+    audioQueueRef.current.sort((a, b) => (b.priority - a.priority) || (a.seq - b.seq));
+
+    // 4. Start or resume queue processing
+    if (!isAudioPlayingRef.current || isInterrupted) {
       processAudioQueue();
     }
   };
@@ -297,6 +428,7 @@ export const Classroom: React.FC<ClassroomProps> = ({
   const processAudioQueue = async () => {
     if (audioQueueRef.current.length === 0) {
       isAudioPlayingRef.current = false;
+      currentPlayingItemRef.current = null;
       return;
     }
 
@@ -317,14 +449,19 @@ export const Classroom: React.FC<ClassroomProps> = ({
     }
 
     isAudioPlayingRef.current = true;
-    const { text, studentName, emotion } = audioQueueRef.current[0];
+    const currentItem = audioQueueRef.current[0];
+    currentPlayingItemRef.current = currentItem;
+    const { text, studentName, emotion, creationTime } = currentItem as any;
+
+    if (creationTime) {
+      logLatency('queue', Date.now() - creationTime);
+    }
 
     // 1. Temporarily save the student's emotion to restore later
     setStudentEmotions((prev) => {
       const restored = { ...prev };
-      // Save the target emotion (the one they got from Gemini) so we can return to it later
+      // Save the target emotion so we can return to it later
       originalEmotionsRef.current[studentName] = emotion;
-      // Do NOT set mouth talking animation - keep their original emotion
       restored[studentName] = emotion || 'normal';
       return restored;
     });
@@ -355,6 +492,7 @@ export const Classroom: React.FC<ClassroomProps> = ({
 
       // De-queue the spoken item and recurse to play the next one
       audioQueueRef.current.shift();
+      currentPlayingItemRef.current = null;
       
       // Check if there are no more items left in the queue!
       if (audioQueueRef.current.length === 0) {
@@ -363,6 +501,7 @@ export const Classroom: React.FC<ClassroomProps> = ({
         if (wasMicEnabledRef.current) {
           if (hasSttKeys) {
             console.info("[Mic Auto-Resume] Audio queue empty. VAD listening automatically resumed.");
+            startVAD();
           } else if (recognitionRef.current) {
             try {
               recognitionRef.current.start();
@@ -386,6 +525,7 @@ export const Classroom: React.FC<ClassroomProps> = ({
     }
 
     // Try playing neural voice from Edge TTS backend
+    const ttsStart = Date.now();
     let fallbackTriggered = false;
     let hasStartedPlaying = false;
     const triggerFallback = (reason: string) => {
@@ -404,9 +544,8 @@ export const Classroom: React.FC<ClassroomProps> = ({
         currentAudioRef.current = null;
       }
       
-      playBrowserSpeechFallback(text, studentName, handleSpeechEnded);
+      playBrowserSpeechFallback(text, studentName, handleSpeechEnded, ttsStart);
     };
-
     try {
       const audioUrl = `${API_BASE_URL}/api/tts?text=${encodeURIComponent(text)}&student=${encodeURIComponent(studentName)}&language=${encodeURIComponent(language)}`;
       const audio = new Audio(audioUrl);
@@ -415,10 +554,16 @@ export const Classroom: React.FC<ClassroomProps> = ({
       audio.volume = volume;
 
       audio.onplay = () => {
+        if (!hasStartedPlaying) {
+          logLatency('tts', Date.now() - ttsStart);
+        }
         hasStartedPlaying = true;
       };
 
       audio.onplaying = () => {
+        if (!hasStartedPlaying) {
+          logLatency('tts', Date.now() - ttsStart);
+        }
         hasStartedPlaying = true;
       };
 
@@ -437,7 +582,7 @@ export const Classroom: React.FC<ClassroomProps> = ({
     }
   };
 
-  const playBrowserSpeechFallback = (text: string, studentName: string, onEnded: () => void) => {
+  const playBrowserSpeechFallback = (text: string, studentName: string, onEnded: () => void, ttsStart: number) => {
     if (!('speechSynthesis' in window)) {
       onEnded();
       return;
@@ -575,6 +720,10 @@ export const Classroom: React.FC<ClassroomProps> = ({
     utterance.pitch = pitch;
     utterance.rate = rate;
 
+    utterance.onstart = () => {
+      logLatency('tts', Date.now() - ttsStart);
+    };
+
     utterance.onend = () => {
       activeUtteranceRef.current = null;
       onEnded();
@@ -641,6 +790,7 @@ export const Classroom: React.FC<ClassroomProps> = ({
     setMessages((prev) => [...prev, tempTeacherMsg]);
 
     try {
+      const llmStart = Date.now();
       const response = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}/turns`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -654,6 +804,11 @@ export const Classroom: React.FC<ClassroomProps> = ({
       if (!response.ok) throw new Error('Turn processing failed');
 
       const data = await response.json();
+      logLatency('llm', Date.now() - llmStart);
+
+      if (data.classroom_state) {
+        setClassroomState(data.classroom_state);
+      }
 
       // If a system event was triggered, append to messages
       if (data.triggered_event) {
@@ -773,6 +928,14 @@ export const Classroom: React.FC<ClassroomProps> = ({
 
   // Cleanup VAD and stop microphone
   const cleanupVAD = () => {
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch (e) {}
+      wsRef.current = null;
+    }
+    setInterimText('');
+
     if (vadIntervalRef.current) {
       clearInterval(vadIntervalRef.current);
       vadIntervalRef.current = null;
@@ -806,6 +969,7 @@ export const Classroom: React.FC<ClassroomProps> = ({
   const uploadAndTranscribe = async (audioBlob: Blob, mimeType: string = 'audio/webm') => {
     try {
       setIsPending(true);
+      const sttStartTime = Date.now();
       const formData = new FormData();
       const fileExtension = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('ogg') ? 'ogg' : 'webm';
       formData.append('file', audioBlob, `speech.${fileExtension}`);
@@ -826,7 +990,19 @@ export const Classroom: React.FC<ClassroomProps> = ({
       const data = await response.json();
       console.info("[STT] Transcribed successfully:", data.text);
 
-      if (data.text && data.text.trim()) {
+      logLatency('stt', Date.now() - sttStartTime);
+
+      if (data.low_confidence) {
+        console.warn("[STT] Low confidence transcription received:", data.text);
+        const systemMsg: Message = {
+          id: `low-conf-${Date.now()}`,
+          sender_name: "System",
+          sender_type: "system",
+          message_text: "I couldn't clearly hear that. Could you repeat?",
+          timestamp: new Date().toISOString()
+        };
+        setMessages((prev) => [...prev, systemMsg]);
+      } else if (data.text && data.text.trim()) {
         await handleSendTurn(data.text);
       }
     } catch (e) {
@@ -836,14 +1012,76 @@ export const Classroom: React.FC<ClassroomProps> = ({
     }
   };
 
-  // Start microphone VAD tracking
+  // Start microphone VAD tracking with WebSocket binary streaming & REST fallback
   const startVAD = async () => {
     try {
-      // 1. Get User Media
+      setInterimText('');
+
+      // 1. Establish WebSocket Connection for Real-Time Streaming STT
+      const wsScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      let wsUrl = '';
+      if (API_BASE_URL.startsWith('http://') || API_BASE_URL.startsWith('https://')) {
+        wsUrl = API_BASE_URL.replace(/^http/, 'ws') + '/api/stream-stt';
+      } else {
+        wsUrl = `${wsScheme}//${window.location.host}${API_BASE_URL}/api/stream-stt`;
+      }
+
+      console.info("[WS-STT] Connecting to streaming socket:", wsUrl);
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.info("[WS-STT] Microphone streaming socket connected successfully.");
+      };
+
+      ws.onmessage = async (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.text !== undefined) {
+            if (data.is_final) {
+              console.info("[WS-STT] Definitive final transcription received:", data.text);
+              setInterimText('');
+              
+              if (sttStartTimeRef.current > 0) {
+                logLatency('stt', Date.now() - sttStartTimeRef.current);
+                sttStartTimeRef.current = 0;
+              }
+
+              if (data.low_confidence) {
+                const systemMsg: Message = {
+                  id: `low-conf-${Date.now()}`,
+                  sender_name: "System",
+                  sender_type: "system",
+                  message_text: "I couldn't clearly hear that. Could you repeat?",
+                  timestamp: new Date().toISOString()
+                };
+                setMessages((prev) => [...prev, systemMsg]);
+              } else if (data.text.trim()) {
+                await handleSendTurn(data.text);
+              }
+            } else {
+              console.log("[WS-STT] Interim text update:", data.text);
+              setInterimText(data.text);
+            }
+          }
+        } catch (e) {
+          console.error("[WS-STT] Message parsing error:", e);
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.error("[WS-STT] Socket error occurred:", err);
+      };
+
+      ws.onclose = () => {
+        console.info("[WS-STT] Streaming socket connection closed.");
+      };
+
+      // 2. Get User Media Stream
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
-      // 2. Setup Web Audio
+      // 3. Setup Web Audio VAD
       const AudioContextClass = (window.AudioContext || (window as any).webkitAudioContext);
       const audioCtx = new AudioContextClass();
       audioContextRef.current = audioCtx;
@@ -856,7 +1094,7 @@ export const Classroom: React.FC<ClassroomProps> = ({
 
       setIsListening(true);
 
-      // Start MediaRecorder IMMEDIATELY instead of waiting for a high silence threshold
+      // 4. Setup MediaRecorder with Browser-Supported Codec
       audioChunksRef.current = [];
       let options: MediaRecorderOptions = {};
       if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
@@ -874,32 +1112,51 @@ export const Classroom: React.FC<ClassroomProps> = ({
       const mediaRecorder = new MediaRecorder(stream, options);
       mediaRecorderRef.current = mediaRecorder;
 
-      mediaRecorder.ondataavailable = (event) => {
+      mediaRecorder.ondataavailable = async (event) => {
         if (event.data && event.data.size > 0) {
           audioChunksRef.current.push(event.data);
+          
+          // Send binary chunk over WebSocket in real-time
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              const arrayBuffer = await event.data.arrayBuffer();
+              ws.send(arrayBuffer);
+            } catch (err) {
+              console.error("[WS-STT] Binary chunk send failed:", err);
+            }
+          }
         }
       };
 
       mediaRecorder.onstop = async () => {
         console.log("[VAD] MediaRecorder stopped. Chunks:", audioChunksRef.current.length);
-        if (audioChunksRef.current.length === 0) return;
         
+        // 1. If WebSocket is open and ready, trigger server-side final transcription
+        if (ws.readyState === WebSocket.OPEN) {
+          console.info("[WS-STT] Sending STOP token to WebSocket.");
+          sttStartTimeRef.current = Date.now();
+          ws.send("STOP");
+          return;
+        }
+
+        // 2. Otherwise fall back to REST uploadAndTranscribe
+        if (audioChunksRef.current.length === 0) return;
         const recordedType = mediaRecorder.mimeType || 'audio/webm';
         const audioBlob = new Blob(audioChunksRef.current, { type: recordedType });
         audioChunksRef.current = [];
-        
         await uploadAndTranscribe(audioBlob, recordedType);
       };
 
       try {
-        mediaRecorder.start(100);
+        // start recording and fire ondataavailable every 250ms for real-time binary streaming
+        mediaRecorder.start(250);
         isRecordingRef.current = true;
-        console.log("[Mic] MediaRecorder started recording immediately.");
+        console.log("[Mic] MediaRecorder started recording with 250ms chunks.");
       } catch (err) {
         console.error("[Mic] Failed to start MediaRecorder:", err);
       }
 
-      // 3. Set VAD checking loop (Only used to track speech presence and auto-submit after pause)
+      // 5. Set VAD Checking Loop
       const threshold = 0.005; // Lowered amplitude threshold (highly responsive)
       const bufferLength = analyser.fftSize;
       const dataArray = new Uint8Array(bufferLength);
@@ -1013,6 +1270,79 @@ export const Classroom: React.FC<ClassroomProps> = ({
     const minutes = Math.floor(secs / 60);
     const seconds = secs % 60;
     return `${minutes}${t.minutes} : ${seconds < 10 ? '0' : ''}${seconds}${t.seconds}`;
+  };
+
+  const getCoachingAdvice = () => {
+    const currentTurn = messages.length;
+
+    const isCoolingDown = (category: string) => {
+      const lastShown = adviceShownHistoryRef.current[category];
+      return lastShown !== undefined && lastShown !== currentTurn && (currentTurn - lastShown < 3);
+    };
+
+    // Check conditions in order of priority, skipping categories on cooldown
+    if (classroomState.noise > 60 && !isCoolingDown('noise')) {
+      adviceShownHistoryRef.current['noise'] = currentTurn;
+      return {
+        type: 'warning',
+        text: 'Classroom noise is rising. Address a student directly or use a refocus command.'
+      };
+    }
+    if (classroomState.attention < 50 && !isCoolingDown('attention')) {
+      adviceShownHistoryRef.current['attention'] = currentTurn;
+      return {
+        type: 'warning',
+        text: 'Attention is low. Change the teaching method or share the blackboard to re-engage!'
+      };
+    }
+    if (classroomState.confusion > 55 && !isCoolingDown('confusion')) {
+      adviceShownHistoryRef.current['confusion'] = currentTurn;
+      return {
+        type: 'info',
+        text: 'Students are highly confused. Try illustrating an example on the Blackboard!'
+      };
+    }
+    
+    // Consecutive teacher lecturing check
+    const lastTwoConversations = messages
+      .filter(m => m.sender_type === 'teacher' || m.sender_type === 'student')
+      .slice(-2);
+    const consecutiveTeacher = lastTwoConversations.length === 2 && lastTwoConversations.every(m => m.sender_type === 'teacher');
+    const latestTeacherMsg = messages.filter(m => m.sender_type === 'teacher').slice(-1)[0];
+    const latestWordCount = latestTeacherMsg ? latestTeacherMsg.message_text.split(/\s+/).filter(Boolean).length : 0;
+    if (latestWordCount > 35 && consecutiveTeacher && !isCoolingDown('lecturing')) {
+      adviceShownHistoryRef.current['lecturing'] = currentTurn;
+      return {
+        type: 'warning',
+        text: 'Student engagement dropping. Ask a volunteer or call on a student to answer!'
+      };
+    }
+
+    // Low questions check
+    const lastFourTeacher = messages.filter(m => m.sender_type === 'teacher').slice(-4);
+    const hasQuestion = lastFourTeacher.some(m => m.message_text.includes('?'));
+    if (lastFourTeacher.length >= 4 && !hasQuestion && !isCoolingDown('questions')) {
+      adviceShownHistoryRef.current['questions'] = currentTurn;
+      return {
+        type: 'info',
+        text: 'Consider asking open-ended questions to stimulate critical thinking.'
+      };
+    }
+
+    // Fallback / default positive encouragement
+    if (classroomState.engagement > 75) {
+      adviceShownHistoryRef.current['success_engagement'] = currentTurn;
+      return {
+        type: 'success',
+        text: 'Excellent flow! Students are highly engaged. Keep pushing the current topic!'
+      };
+    }
+
+    adviceShownHistoryRef.current['stable'] = currentTurn;
+    return {
+      type: 'success',
+      text: 'Classroom dynamic is stable. Ask a student by name to test their understanding.'
+    };
   };
 
   const hasActiveBubble = !!activeSpeaker || (isPending && !!pendingStudent);
@@ -1264,6 +1594,289 @@ export const Classroom: React.FC<ClassroomProps> = ({
         </div>
       </div>
 
+      {/* ⏱️ Floating Glassmorphic Collapsible Latency Dashboard Widget */}
+      <div 
+        style={{
+          position: 'fixed',
+          top: '5.5rem',
+          right: isChatOpen ? '25rem' : '1.5rem',
+          zIndex: 90,
+          background: 'rgba(15, 23, 42, 0.7)',
+          backdropFilter: 'blur(16px)',
+          WebkitBackdropFilter: 'blur(16px)',
+          border: '1px solid rgba(255, 255, 255, 0.1)',
+          borderRadius: '16px',
+          color: '#f8fafc',
+          boxShadow: '0 10px 40px rgba(0, 0, 0, 0.4)',
+          width: isLatencyOpen ? '280px' : 'auto',
+          padding: isLatencyOpen ? '1.25rem' : '0.5rem 0.85rem',
+          transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+          cursor: isLatencyOpen ? 'default' : 'pointer',
+          fontFamily: 'Inter, system-ui, sans-serif'
+        }}
+        onClick={() => { if (!isLatencyOpen) setIsLatencyOpen(true); }}
+      >
+        {!isLatencyOpen ? (
+          /* Collapsed Pill Badge View */
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem', fontWeight: 600, letterSpacing: '0.025em' }}>
+            <span style={{ 
+              width: '8px', 
+              height: '8px', 
+              borderRadius: '50%', 
+              background: latencyLogs.llm > 3000 || latencyLogs.stt > 2500 ? '#ef4444' : (latencyLogs.llm > 1500 ? '#eab308' : '#22c55e'),
+              display: 'inline-block',
+              boxShadow: `0 0 10px ${latencyLogs.llm > 3000 || latencyLogs.stt > 2500 ? '#ef4444' : (latencyLogs.llm > 1500 ? '#eab308' : '#22c55e')}`
+            }}></span>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ color: '#3b82f6' }}><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            <span>Telemetry</span>
+            <span style={{ fontSize: '0.75rem', opacity: 0.6 }}>({latencyLogs.llm ? `${latencyLogs.llm}ms` : '0ms'})</span>
+          </div>
+        ) : (
+          /* Expanded Whiteboard Analytics View */
+          <div>
+            {/* Header */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', borderBottom: '1px solid rgba(255, 255, 255, 0.1)', paddingBottom: '0.5rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontWeight: 700, fontSize: '0.88rem', letterSpacing: '0.02em', color: '#3b82f6' }}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                <span>Pipeline Telemetry</span>
+              </div>
+              <button 
+                onClick={(e) => { e.stopPropagation(); setIsLatencyOpen(false); }}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: 'rgba(255, 255, 255, 0.5)',
+                  cursor: 'pointer',
+                  padding: '2px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}
+                type="button"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="18" x2="6" y1="6" y2="18"/><line x1="6" x2="18" y1="6" y2="18"/></svg>
+              </button>
+            </div>
+
+            {/* Gauge List */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem', fontSize: '0.8rem' }}>
+              {/* STT Gauge */}
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem', opacity: 0.9 }}>
+                  <span>STT Pipeline</span>
+                  <span style={{ fontWeight: 600, color: latencyLogs.stt > 2500 ? '#ef4444' : '#f8fafc' }}>{latencyLogs.stt} ms</span>
+                </div>
+                <div style={{ height: '4px', background: 'rgba(255,255,255,0.06)', borderRadius: '2px', overflow: 'hidden' }}>
+                  <div style={{ 
+                    height: '100%', 
+                    width: `${Math.min(100, (latencyLogs.stt / 5000) * 100)}%`, 
+                    background: latencyLogs.stt > 2500 ? 'linear-gradient(90deg, #ef4444, #b91c1c)' : 'linear-gradient(90deg, #3b82f6, #60a5fa)',
+                    borderRadius: '2px'
+                  }}></div>
+                </div>
+              </div>
+
+              {/* LLM Gauge */}
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem', opacity: 0.9 }}>
+                  <span>LLM Engine</span>
+                  <span style={{ fontWeight: 600, color: latencyLogs.llm > 3000 ? '#ef4444' : '#f8fafc' }}>{latencyLogs.llm} ms</span>
+                </div>
+                <div style={{ height: '4px', background: 'rgba(255,255,255,0.06)', borderRadius: '2px', overflow: 'hidden' }}>
+                  <div style={{ 
+                    height: '100%', 
+                    width: `${Math.min(100, (latencyLogs.llm / 6000) * 100)}%`, 
+                    background: latencyLogs.llm > 3000 ? 'linear-gradient(90deg, #ef4444, #f43f5e)' : 'linear-gradient(90deg, #10b981, #34d399)',
+                    borderRadius: '2px'
+                  }}></div>
+                </div>
+              </div>
+
+              {/* TTS Gauge */}
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem', opacity: 0.9 }}>
+                  <span>TTS Synthesizer</span>
+                  <span style={{ fontWeight: 600, color: latencyLogs.tts > 1500 ? '#eab308' : '#f8fafc' }}>{latencyLogs.tts} ms</span>
+                </div>
+                <div style={{ height: '4px', background: 'rgba(255,255,255,0.06)', borderRadius: '2px', overflow: 'hidden' }}>
+                  <div style={{ 
+                    height: '100%', 
+                    width: `${Math.min(100, (latencyLogs.tts / 3000) * 100)}%`, 
+                    background: latencyLogs.tts > 1500 ? 'linear-gradient(90deg, #eab308, #ca8a04)' : 'linear-gradient(90deg, #8b5cf6, #a78bfa)',
+                    borderRadius: '2px'
+                  }}></div>
+                </div>
+              </div>
+
+              {/* Queue Wait */}
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem', opacity: 0.9 }}>
+                  <span>Priority Queue Wait</span>
+                  <span style={{ fontWeight: 600 }}>{latencyLogs.queue} ms</span>
+                </div>
+                <div style={{ height: '4px', background: 'rgba(255,255,255,0.06)', borderRadius: '2px', overflow: 'hidden' }}>
+                  <div style={{ 
+                    height: '100%', 
+                    width: `${Math.min(100, (latencyLogs.queue / 2000) * 100)}%`, 
+                    background: 'linear-gradient(90deg, #f97316, #fb923c)',
+                    borderRadius: '2px'
+                  }}></div>
+                </div>
+              </div>
+            </div>
+
+            {/* Warning Alert Banner */}
+            {(latencyLogs.stt > 2500 || latencyLogs.llm > 3000 || latencyLogs.tts > 1500 || latencyLogs.queue > 2000) && (
+              <div style={{
+                marginTop: '0.75rem',
+                padding: '0.5rem 0.75rem',
+                borderRadius: '8px',
+                background: 'rgba(245, 158, 11, 0.15)',
+                border: '1px solid rgba(245, 158, 11, 0.3)',
+                color: '#fbbf24',
+                fontSize: '0.7rem',
+                lineHeight: 1.3,
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.35rem'
+              }}>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" style={{ flexShrink: 0 }}><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" x2="12" y1="9" y2="13"/><line x1="12" x2="12.01" y1="17" y2="17"/></svg>
+                <span>
+                  {latencyLogs.stt > 2500 && "STT latency high. "}
+                  {latencyLogs.llm > 3000 && "AI generation delayed. "}
+                  {latencyLogs.tts > 1500 && "Speech generation lag. "}
+                  {latencyLogs.queue > 2000 && "Queue wait bottleneck. "}
+                  Optimizations warning.
+                </span>
+              </div>
+            )}
+
+            {/* ECE Classroom Metrics Gauges */}
+            <div style={{ margin: '1rem 0 0.8rem 0', borderTop: '1px solid rgba(255, 255, 255, 0.1)' }} />
+            <div style={{ fontWeight: 700, color: '#3b82f6', textTransform: 'uppercase', fontSize: '0.65rem', marginBottom: '0.6rem', letterSpacing: '0.05em' }}>
+              Classroom Dynamics
+            </div>
+            
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem', fontSize: '0.8rem' }}>
+              {/* Noise Gauge */}
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem', opacity: 0.9 }}>
+                  <span>Class Noise</span>
+                  <span style={{ fontWeight: 600, color: classroomState.noise > 60 ? '#ef4444' : classroomState.noise > 45 ? '#f59e0b' : '#10b981' }}>
+                    {classroomState.noise}%
+                  </span>
+                </div>
+                <div style={{ height: '4px', background: 'rgba(255,255,255,0.06)', borderRadius: '2px', overflow: 'hidden' }}>
+                  <div style={{ 
+                    height: '100%', 
+                    width: `${classroomState.noise}%`, 
+                    background: classroomState.noise > 60 ? 'linear-gradient(90deg, #f59e0b, #ef4444)' : 'linear-gradient(90deg, #10b981, #f59e0b)',
+                    borderRadius: '2px',
+                    transition: 'width 0.5s ease-in-out'
+                  }}></div>
+                </div>
+              </div>
+
+              {/* Stress Gauge */}
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem', opacity: 0.9 }}>
+                  <span>Class Stress</span>
+                  <span style={{ fontWeight: 600, color: classroomState.stress > 50 ? '#ec4899' : '#f8fafc' }}>
+                    {classroomState.stress}%
+                  </span>
+                </div>
+                <div style={{ height: '4px', background: 'rgba(255,255,255,0.06)', borderRadius: '2px', overflow: 'hidden' }}>
+                  <div style={{ 
+                    height: '100%', 
+                    width: `${classroomState.stress}%`, 
+                    background: 'linear-gradient(90deg, #3b82f6, #8b5cf6, #ec4899)',
+                    borderRadius: '2px',
+                    transition: 'width 0.5s ease-in-out'
+                  }}></div>
+                </div>
+              </div>
+
+              {/* Curiosity Gauge */}
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem', opacity: 0.9 }}>
+                  <span>Curiosity</span>
+                  <span style={{ fontWeight: 600, color: '#a855f7' }}>
+                    {classroomState.curiosity}%
+                  </span>
+                </div>
+                <div style={{ height: '4px', background: 'rgba(255,255,255,0.06)', borderRadius: '2px', overflow: 'hidden' }}>
+                  <div style={{ 
+                    height: '100%', 
+                    width: `${classroomState.curiosity}%`, 
+                    background: 'linear-gradient(90deg, #6366f1, #a855f7)',
+                    borderRadius: '2px',
+                    transition: 'width 0.5s ease-in-out'
+                  }}></div>
+                </div>
+              </div>
+            </div>
+
+            {/* B.Ed Live Coaching Advisor Card */}
+            {(() => {
+              const advice = getCoachingAdvice();
+              const glowColor = advice.type === 'warning' ? 'rgba(239, 68, 68, 0.4)' : advice.type === 'info' ? 'rgba(59, 130, 246, 0.4)' : 'rgba(16, 185, 129, 0.4)';
+              const borderColor = advice.type === 'warning' ? 'rgba(239, 68, 68, 0.3)' : advice.type === 'info' ? 'rgba(59, 130, 246, 0.3)' : 'rgba(16, 185, 129, 0.3)';
+              const bgGlow = advice.type === 'warning' ? 'rgba(239, 68, 68, 0.08)' : advice.type === 'info' ? 'rgba(59, 130, 246, 0.08)' : 'rgba(16, 185, 129, 0.08)';
+              const icon = advice.type === 'warning' ? '⚠️' : advice.type === 'info' ? '💡' : '🎓';
+              
+              return (
+                <div style={{ marginTop: '1rem', borderTop: '1px solid rgba(255, 255, 255, 0.1)', paddingTop: '0.8rem' }}>
+                  <div style={{ fontWeight: 700, color: '#10b981', textTransform: 'uppercase', fontSize: '0.65rem', marginBottom: '0.4rem', letterSpacing: '0.05em' }}>
+                    B.Ed Live Coaching Advisor
+                  </div>
+                  <div style={{ 
+                    background: bgGlow, 
+                    border: `1px solid ${borderColor}`, 
+                    borderRadius: '8px', 
+                    padding: '0.6rem 0.75rem', 
+                    boxShadow: `0 0 12px ${glowColor}`,
+                    display: 'flex',
+                    gap: '0.45rem',
+                    alignItems: 'flex-start',
+                    fontSize: '0.72rem',
+                    lineHeight: '1.3',
+                    transition: 'all 0.3s ease'
+                  }}>
+                    <span style={{ fontSize: '0.9rem', lineHeight: '1' }}>{icon}</span>
+                    <span style={{ color: 'rgba(255, 255, 255, 0.95)', fontWeight: 500 }}>{advice.text}</span>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Threshold Warning alerts */}
+            {(latencyLogs.llm > 3000 || latencyLogs.stt > 2500) && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#ef4444', fontSize: '0.7rem', marginTop: '0.75rem', fontWeight: 600, background: 'rgba(239, 68, 68, 0.08)', padding: '0.35rem', borderRadius: '6px', border: '1px solid rgba(239, 68, 68, 0.15)' }}>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" x2="12" y1="9" y2="13"/><line x1="12" x2="12.01" y1="17" y2="17"/></svg>
+                <span>Slow connection/API delay detected</span>
+              </div>
+            )}
+
+            {/* Log History */}
+            <div style={{ marginTop: '0.9rem', fontSize: '0.72rem' }}>
+              <div style={{ fontWeight: 700, color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase', fontSize: '0.65rem', marginBottom: '0.3rem', letterSpacing: '0.05em' }}>Recent Telemetry Log</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', maxHeight: '72px', overflowY: 'auto', paddingRight: '2px' }}>
+                {latencyLogs.history.length === 0 ? (
+                  <span style={{ color: 'rgba(255,255,255,0.3)', fontStyle: 'italic' }}>No logs recorded yet...</span>
+                ) : (
+                  latencyLogs.history.slice(0, 3).map((h, i) => (
+                    <div key={i} style={{ display: 'flex', justifyContent: 'space-between', color: 'rgba(255,255,255,0.75)', background: 'rgba(255,255,255,0.02)', padding: '2px 4px', borderRadius: '4px' }}>
+                      <span style={{ fontWeight: 600, color: h.type === 'LLM' ? '#10b981' : h.type === 'STT' ? '#3b82f6' : h.type === 'TTS' ? '#8b5cf6' : '#f97316' }}>{h.type}</span>
+                      <span>{h.duration} ms <span style={{ opacity: 0.4 }}>({h.timestamp.split(' ')[0]})</span></span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Right Side Sliding Chat Drawer */}
       <div className={`chat-drawer ${isChatOpen ? 'open' : ''}`}>
         <div className="transcript-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1rem', borderBottom: '1px solid var(--border-card)' }}>
@@ -1373,6 +1986,43 @@ export const Classroom: React.FC<ClassroomProps> = ({
           className="text-input-container"
           style={{ flex: 1, display: 'flex', alignItems: 'center', position: 'relative' }}
         >
+          {isListening && interimText && (
+            <div 
+              style={{
+                position: 'absolute',
+                bottom: '100%',
+                left: '1rem',
+                marginBottom: '0.75rem',
+                padding: '0.5rem 1rem',
+                background: 'rgba(15, 23, 42, 0.85)',
+                backdropFilter: 'blur(12px)',
+                WebkitBackdropFilter: 'blur(12px)',
+                borderRadius: '12px 12px 12px 0px',
+                border: '1px solid rgba(255, 255, 255, 0.1)',
+                color: '#e2e8f0',
+                fontSize: '0.85rem',
+                boxShadow: '0 4px 20px rgba(0, 0, 0, 0.4)',
+                zIndex: 40,
+                pointerEvents: 'none',
+                maxWidth: '85%',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.4rem',
+                transition: 'all 0.2s ease-in-out'
+              }}
+            >
+              <span style={{ 
+                width: '8px', 
+                height: '8px', 
+                background: '#3b82f6', 
+                borderRadius: '50%', 
+                display: 'inline-block', 
+                boxShadow: '0 0 8px #3b82f6'
+              }}></span>
+              <strong style={{ color: '#3b82f6' }}>Draft:</strong>
+              <span>{interimText}</span>
+            </div>
+          )}
           <input
             type="text"
             className="dock-input"
