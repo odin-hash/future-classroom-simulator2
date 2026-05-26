@@ -7,10 +7,7 @@ from collections import OrderedDict
 from typing import Dict, Any
 
 
-# Resolve absolute paths relative to the backend directory
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.path.join(BACKEND_DIR, "audio_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
+# Purely in-memory audio caching is utilized to support read-only production filesystems.
 
 # Map student names to their voice profiles
 # Edge TTS voices: https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support

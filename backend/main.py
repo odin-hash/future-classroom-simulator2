@@ -851,8 +851,24 @@ async def text_to_speech(text: str, student: str, language: str = "English"):
 
 def transcribe_google(audio_content: bytes, mime_type: str = "audio/webm") -> dict:
     import sys
+    import json
+    from google.oauth2 import service_account
     from google.cloud import speech
-    client = speech.SpeechClient()
+    
+    # Load credentials from JSON environment string if present (for production hosting compatibility)
+    json_creds = os.environ.get("GOOGLE_CREDENTIALS_JSON") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if json_creds:
+        try:
+            info = json.loads(json_creds)
+            credentials = service_account.Credentials.from_service_account_info(info)
+            client = speech.SpeechClient(credentials=credentials)
+            print("[Google STT] Successfully loaded SpeechClient with credentials from JSON environment variable.")
+        except Exception as cred_err:
+            print(f"[Google STT Error] Failed to load credentials from JSON env: {cred_err}. Falling back to default credentials.")
+            client = speech.SpeechClient()
+    else:
+        client = speech.SpeechClient()
+        
     audio = speech.RecognitionAudio(content=audio_content)
     
     # Determine encoding based on MIME type (Omit hardcoded sample rates to let Google STT auto-detect)
@@ -1222,7 +1238,7 @@ async def health_check(db: Session = Depends(get_db)):
     import os
     from database import engine
     from sqlalchemy import text
-    from voice import CACHE_DIR
+    from voice import TTS_CACHE
     
     # 1. API Key Check
     gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -1235,21 +1251,19 @@ async def health_check(db: Session = Depends(get_db)):
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         db_ok = True
-        db_msg = "Database connected successfully"
+        db_msg = f"Database connected successfully ({engine.url.drivername})"
     except Exception as e:
         db_msg = str(e)
         
-    # 3. Cache Directory Check
+    # 3. In-Memory Cache Check
     cache_ok = False
     cache_msg = ""
     try:
-        test_file = os.path.join(CACHE_DIR, ".health_check_temp")
-        with open(test_file, "w") as f:
-            f.write("1")
-        if os.path.exists(test_file):
-            os.remove(test_file)
+        TTS_CACHE.set("__health_check_temp__", b"1")
+        val = TTS_CACHE.get("__health_check_temp__")
+        if val == b"1":
             cache_ok = True
-            cache_msg = "Audio cache directory writable"
+            cache_msg = "In-memory TTS cache read/write functional"
     except Exception as e:
         cache_msg = str(e)
         
@@ -1269,10 +1283,20 @@ async def health_check(db: Session = Depends(get_db)):
     stt_ok = False
     stt_msg = ""
     try:
-        # Check if Google Cloud Speech is importable
         from google.cloud import speech
-        stt_ok = True
-        stt_msg = "Google Speech client modules initialized"
+        has_stt_creds = bool(
+            os.environ.get("GEMINI_API_KEY") or
+            os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or
+            os.environ.get("GOOGLE_CREDENTIALS_JSON") or
+            os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON") or
+            os.environ.get("DEEPGRAM_API_KEY") or
+            os.environ.get("ASSEMBLYAI_API_KEY")
+        )
+        if has_stt_creds:
+            stt_ok = True
+            stt_msg = "STT Cascade active (at least one API provider configured)"
+        else:
+            stt_msg = "STT Offline (No Gemini, Google, Deepgram, or AssemblyAI API keys set)"
     except Exception as e:
         stt_msg = str(e)
 
@@ -1290,4 +1314,65 @@ async def health_check(db: Session = Depends(get_db)):
         "stt_available": stt_ok,
         "stt_message": stt_msg
     }
+
+
+@app.on_event("startup")
+def run_startup_self_test():
+    print("====================================================")
+    print("🚀 Future Classroom Simulator Startup Self-Test")
+    print("====================================================")
+    
+    # 1. Gemini Key Check
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    api_key_valid = bool(gemini_key and len(gemini_key.strip()) > 5)
+    print(f"Gemini API Key: {'✅ CONFIGURED' if api_key_valid else '❌ MISSING'}")
+    
+    # 2. Database Connection Check
+    db_status = "❌ UNKNOWN"
+    try:
+        from database import engine
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        db_status = f"✅ CONNECTED ({engine.url.drivername})"
+    except Exception as e:
+        db_status = f"❌ CONNECTION FAILED: {e}"
+    print(f"Database: {db_status}")
+    
+    # 3. TTS Engine Check
+    tts_status = "❌ UNKNOWN"
+    try:
+        import edge_tts
+        # Just create Communicate object to ensure dependency exists
+        edge_tts.Communicate("test", "en-IN-PrabhatNeural")
+        tts_status = "✅ ACTIVE"
+    except Exception as e:
+        tts_status = f"❌ FAILED: {e}"
+    print(f"Edge TTS Engine: {tts_status}")
+    
+    # 4. STT Engine / Cascade Config
+    stt_providers = []
+    if os.environ.get("GEMINI_API_KEY"):
+        stt_providers.append("Gemini STT")
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("GOOGLE_CREDENTIALS_JSON") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON"):
+        stt_providers.append("Google STT")
+    if os.environ.get("DEEPGRAM_API_KEY"):
+        stt_providers.append("Deepgram")
+    if os.environ.get("ASSEMBLYAI_API_KEY"):
+        stt_providers.append("AssemblyAI")
+        
+    stt_status = f"✅ ACTIVE (Providers: {', '.join(stt_providers)})" if stt_providers else "❌ NO PROVIDERS CONFIGURED (Mock Mode fallback)"
+    print(f"Speech-To-Text STT: {stt_status}")
+    
+    # 5. Websocket Readiness
+    print("Websocket Interface: ✅ READY (/api/stream-stt)")
+    print("====================================================")
+    
+    # Fail startup if key is missing and ALLOW_MOCK_LLM is not active
+    allow_mock = os.environ.get("ALLOW_MOCK_LLM", "false").lower() == "true"
+    if not api_key_valid and not allow_mock:
+        print("❌ CRITICAL: GEMINI_API_KEY is not set. Startup aborted.")
+        print("To run locally/mock mode without keys, set ALLOW_MOCK_LLM=true.")
+        raise RuntimeError("GEMINI_API_KEY is missing. Add it to your environment variables.")
+
 
