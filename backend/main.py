@@ -66,15 +66,29 @@ except Exception as db_err:
 
 app = FastAPI(title="Future Classroom Simulator API")
 
-# Configure CORS for Vite Frontend
+# Configure CORS for Vite Frontend with explicit allowed origins
+allowed_origins_env = os.environ.get("ALLOWED_ORIGINS")
+if allowed_origins_env:
+    origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
+else:
+    origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://future-classroom-simulator.vercel.app",
+        "https://future-classroom-simulator-git-main-odin-hash.vercel.app",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For local dev simplicity
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Cache", "Content-Length"]
 )
+
 
 
 @app.get("/")
