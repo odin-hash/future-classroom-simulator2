@@ -11,6 +11,24 @@ if raw_db_url and raw_db_url.strip():
 else:
     DATABASE_URL = "sqlite:///./classroom.db"
 
+# Detect if running in a production hosting context
+is_prod = (
+    os.environ.get("RENDER") == "true" or
+    bool(os.environ.get("RAILWAY_STATIC_URL")) or
+    os.environ.get("NODE_ENV") == "production"
+)
+
+# Reject HTTP/HTTPS web address configurations for DATABASE_URL
+if DATABASE_URL.startswith("http://") or DATABASE_URL.startswith("https://"):
+    print(f"❌ CRITICAL: DATABASE_URL is configured as an HTTP web address ('{DATABASE_URL}').")
+    print("This is incorrect. A valid database connection string starting with 'postgresql://' or 'postgres://' is required.")
+    if is_prod:
+        raise RuntimeError(
+            f"Invalid DATABASE_URL configuration: configured as web address '{DATABASE_URL}' instead of a database connection string. "
+            "Please check your Render/Railway environment variables and set DATABASE_URL to your PostgreSQL database URI."
+        )
+    DATABASE_URL = "sqlite:///./classroom.db"
+
 # Normalize 'postgres://' to 'postgresql://' for SQLAlchemy compatibility
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -18,13 +36,6 @@ if DATABASE_URL.startswith("postgres://"):
 # Log parsed dialect status
 dialect = DATABASE_URL.split(":")[0] if ":" in DATABASE_URL else "unknown"
 print(f"[DB] Normalizing database URL. Parsed Dialect: '{dialect}'")
-
-# Detect if running in a production hosting context
-is_prod = (
-    os.environ.get("RENDER") == "true" or
-    bool(os.environ.get("RAILWAY_STATIC_URL")) or
-    os.environ.get("NODE_ENV") == "production"
-)
 
 # Adjust connection settings based on the database driver
 if not (DATABASE_URL.startswith("sqlite") or DATABASE_URL.startswith("postgresql")):
