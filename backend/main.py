@@ -37,32 +37,38 @@ from voice import generate_speech_audio
 
 # Initialize database tables
 try:
+    db_reset = os.environ.get("DB_RESET", "false").lower() == "true"
+    if db_reset:
+        print("[DB] DB_RESET is active. Dropping all existing tables...")
+        Base.metadata.drop_all(bind=engine)
+        print("[DB] Tables dropped successfully.")
+    
     Base.metadata.create_all(bind=engine)
+    print("[DB] Database tables initialized via metadata create_all.")
 except Exception as table_err:
     print(f"[DB] Metadata create_all warning: {table_err}")
 
 # Auto-migrate: Ensure newly added columns exist in deployed database (e.g. Postgres on Render)
+# We execute each ALTER TABLE in its own independent transaction block to prevent failed
+# columns (e.g. columns that already exist) from aborting the SQL transaction for other columns.
 from sqlalchemy import text
-try:
-    with engine.begin() as conn:
-        for table, col_name, col_type in [
-            ("student_states", "curiosity_level", "INTEGER DEFAULT 50"),
-            ("student_states", "interrupt_probability", "INTEGER DEFAULT 20"),
-            ("student_states", "memory_json", "TEXT"),
-            ("sessions", "language", "VARCHAR(50) DEFAULT 'English'"),
-            ("sessions", "lesson_objectives", "TEXT"),
-            ("sessions", "teaching_method", "VARCHAR(100)"),
-            ("sessions", "scenario", "VARCHAR(100) DEFAULT 'normal'"),
-            ("session_messages", "student_personality", "VARCHAR(100)"),
-        ]:
-            try:
-                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}"))
-                print(f"[DB] Added column {col_name} to {table}.")
-            except Exception:
-                # Column likely already exists or table doesn't exist yet
-                pass
-except Exception as db_err:
-    print(f"[DB] Auto-migration helper warning: {db_err}")
+for table, col_name, col_type in [
+    ("student_states", "curiosity_level", "INTEGER DEFAULT 50"),
+    ("student_states", "interrupt_probability", "INTEGER DEFAULT 20"),
+    ("student_states", "memory_json", "TEXT"),
+    ("sessions", "language", "VARCHAR(50) DEFAULT 'English'"),
+    ("sessions", "lesson_objectives", "TEXT"),
+    ("sessions", "teaching_method", "VARCHAR(100)"),
+    ("sessions", "scenario", "VARCHAR(100) DEFAULT 'normal'"),
+    ("session_messages", "student_personality", "VARCHAR(100)"),
+]:
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}"))
+        print(f"[DB] Auto-migration: Successfully added column {col_name} to {table}.")
+    except Exception as col_err:
+        # Ignore errors (column likely already exists or table does not exist)
+        pass
 
 app = FastAPI(title="Future Classroom Simulator API")
 
@@ -1307,13 +1313,18 @@ async def health_check(db: Session = Depends(get_db)):
     except Exception as e:
         stt_msg = str(e)
 
-    overall_passed = api_key_valid and db_ok and cache_ok and tts_ok and stt_ok
+    # 6. Schema Check
+    schema_ok, schema_msg = check_db_schema_valid()
+
+    overall_passed = api_key_valid and db_ok and cache_ok and tts_ok and stt_ok and schema_ok
     
     return {
         "status": "passed" if overall_passed else "failed",
         "api_key_valid": api_key_valid,
         "database_connected": db_ok,
         "database_message": db_msg,
+        "database_schema_valid": schema_ok,
+        "database_schema_message": schema_msg,
         "cache_writable": cache_ok,
         "cache_message": cache_msg,
         "tts_available": tts_ok,
@@ -1321,6 +1332,47 @@ async def health_check(db: Session = Depends(get_db)):
         "stt_available": stt_ok,
         "stt_message": stt_msg
     }
+
+
+def check_db_schema_valid() -> tuple[bool, str]:
+    try:
+        from database import engine
+        from sqlalchemy import inspect
+        inspector = inspect(engine)
+        
+        # Define the exact required tables and columns we want to validate, matching models.py
+        required_schema = {
+            "sessions": [
+                "id", "subject", "topic", "class_level", "lesson_objectives", 
+                "teaching_method", "duration_minutes", "language", "scenario", "created_at"
+            ],
+            "student_states": [
+                "id", "session_id", "student_name", "attention_level", "confidence_level", 
+                "understanding_level", "confusion_level", "curiosity_level", "interrupt_probability", 
+                "memory_summary", "memory_json", "participation_count"
+            ],
+            "session_messages": [
+                "id", "session_id", "sender_type", "sender_name", "message_text", 
+                "student_personality", "timestamp"
+            ],
+            "session_analytics": [
+                "id", "session_id", "communication_score", "engagement_score", 
+                "time_management_score", "question_handling_score", "suggestions", "transcript_summary"
+            ]
+        }
+        
+        for table, columns in required_schema.items():
+            if not inspector.has_table(table):
+                return False, f"Missing table '{table}'"
+            
+            existing_cols = {col["name"] for col in inspector.get_columns(table)}
+            for req_col in columns:
+                if req_col not in existing_cols:
+                    return False, f"Missing column '{req_col}' in table '{table}'"
+                    
+        return True, "VALID"
+    except Exception as e:
+        return False, f"Validation error: {e}"
 
 
 @app.on_event("startup")
@@ -1378,17 +1430,23 @@ async def run_startup_self_test():
     
     # 3. Database Connection Check
     db_status = "❌ UNKNOWN"
+    db_type = "unknown"
     try:
         from database import engine
         from sqlalchemy import text
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        db_status = "✅ CONNECTED"
+        db_type = engine.url.drivername
+        db_status = f"✅ CONNECTED ({db_type})"
     except Exception as e:
         db_status = f"❌ CONNECTION FAILED: {e}"
     print(f"Database: {db_status}")
     
-    # 4. Edge TTS Engine Check with outbound request validation
+    # 4. Database Schema Validation
+    schema_ok, schema_msg = check_db_schema_valid()
+    print(f"Database Schema: {'✅ VALID' if schema_ok else '❌ INVALID (' + schema_msg + ')'}")
+    
+    # 5. Edge TTS Engine Check with outbound request validation
     tts_status = "❌ UNKNOWN"
     try:
         import edge_tts
@@ -1406,7 +1464,7 @@ async def run_startup_self_test():
         tts_status = f"❌ OFFLINE ({e})"
     print(f"Edge TTS Engine: {tts_status}")
     
-    # 5. STT Engine / Cascade Config with actual validation
+    # 6. STT Engine / Cascade Config with actual validation
     stt_providers = []
     
     # Check Google STT loading from JSON or file path
@@ -1439,7 +1497,7 @@ async def run_startup_self_test():
     stt_status = "✅ ACTIVE" if stt_providers else "❌ OFFLINE"
     print(f"Speech-To-Text STT: {stt_status}")
     
-    # 6. Websocket Readiness
+    # 7. Websocket Readiness
     print("Websocket Interface: ✅ READY")
     print("====================================================")
     
