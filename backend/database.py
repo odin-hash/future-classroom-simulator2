@@ -3,10 +3,33 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-# Path to the database file (load from environment variable for hosting, or fallback to local SQLite)
+# Try to resolve a valid PostgreSQL database URL from the environment
 raw_db_url = os.getenv("DATABASE_URL")
+
+# Check if DATABASE_URL is an HTTP/HTTPS address (which is incorrect)
+is_http = raw_db_url and (raw_db_url.strip().startswith("http://") or raw_db_url.strip().startswith("https://"))
+
+if not raw_db_url or not raw_db_url.strip() or is_http:
+    if is_http:
+        print(f"[DB] WARNING: DATABASE_URL is set to an HTTP address ('{raw_db_url}'). Searching for alternative connection strings...")
+    
+    # Try Render auto-injected database credentials
+    alt_db_url = os.getenv("INTERNAL_DATABASE_URL") or os.getenv("EXTERNAL_DATABASE_URL")
+    if alt_db_url and alt_db_url.strip():
+        print(f"[DB] Found and using alternative database URL: {'INTERNAL_DATABASE_URL' if os.getenv('INTERNAL_DATABASE_URL') else 'EXTERNAL_DATABASE_URL'}")
+        raw_db_url = alt_db_url
+    else:
+        # Try individual DB credentials
+        db_user = os.getenv("DB_USER")
+        db_pass = os.getenv("DB_PASSWORD")
+        db_host = os.getenv("DB_HOST")
+        db_port = os.getenv("DB_PORT", "5432")
+        db_name = os.getenv("DB_NAME")
+        if db_user and db_pass and db_host and db_name:
+            print("[DB] Constructing database URL from DB_* environment variables.")
+            raw_db_url = f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+
 if raw_db_url and raw_db_url.strip():
-    # Strip any whitespace, single quotes, or double quotes that can be introduced by copy-pasting env settings
     DATABASE_URL = raw_db_url.strip().strip("'").strip('"')
 else:
     DATABASE_URL = "sqlite:///./classroom.db"
@@ -17,15 +40,16 @@ is_prod = (
     bool(os.environ.get("RAILWAY_STATIC_URL")) or
     os.environ.get("NODE_ENV") == "production"
 )
+allow_sqlite_in_prod = os.environ.get("ALLOW_SQLITE_IN_PROD", "false").lower() == "true"
 
-# Reject HTTP/HTTPS web address configurations for DATABASE_URL
+# Recheck if the resolved DATABASE_URL is still HTTP/HTTPS
 if DATABASE_URL.startswith("http://") or DATABASE_URL.startswith("https://"):
     print(f"❌ CRITICAL: DATABASE_URL is configured as an HTTP web address ('{DATABASE_URL}').")
-    print("This is incorrect. A valid database connection string starting with 'postgresql://' or 'postgres://' is required.")
-    if is_prod:
+    print("A valid database connection string starting with 'postgresql://' or 'postgres://' is required.")
+    if is_prod and not allow_sqlite_in_prod:
         raise RuntimeError(
             f"Invalid DATABASE_URL configuration: configured as web address '{DATABASE_URL}' instead of a database connection string. "
-            "Please check your Render/Railway environment variables and set DATABASE_URL to your PostgreSQL database URI."
+            "Please check your Render/Railway environment variables or set ALLOW_SQLITE_IN_PROD=true to bypass."
         )
     DATABASE_URL = "sqlite:///./classroom.db"
 
@@ -43,8 +67,9 @@ if not (DATABASE_URL.startswith("sqlite") or DATABASE_URL.startswith("postgresql
     DATABASE_URL = "sqlite:///./classroom.db"
 
 if DATABASE_URL.startswith("sqlite"):
-    if is_prod:
+    if is_prod and not allow_sqlite_in_prod:
         print("❌ CRITICAL: Production environment detected but database is missing or configured as SQLite.")
+        print("To override and force SQLite fallback, set ALLOW_SQLITE_IN_PROD=true.")
         raise RuntimeError("PostgreSQL database is required in production deployment contexts.")
     engine = create_engine(
         DATABASE_URL, connect_args={"check_same_thread": False}
@@ -59,7 +84,7 @@ else:
         print(f"[DB] Successfully connected to PostgreSQL database (Engine: {dialect}).")
     except Exception as pg_err:
         print(f"[DB] ERROR: Could not connect to PostgreSQL: {pg_err}")
-        if is_prod:
+        if is_prod and not allow_sqlite_in_prod:
             print("❌ CRITICAL: Database connection failed in production context. Aborting startup to fail-fast.")
             raise RuntimeError(f"PostgreSQL database connection failed: {pg_err}")
         print("[DB] Falling back to local SQLite database.")
