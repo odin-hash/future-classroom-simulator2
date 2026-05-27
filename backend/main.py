@@ -1415,9 +1415,10 @@ async def run_startup_self_test():
                 response = await asyncio.wait_for(
                     loop.run_in_executor(
                         pool,
-                        client.models.generate_content,
-                        "gemini-2.0-flash",
-                        "Ping"
+                        lambda: client.models.generate_content(
+                            model="gemini-2.0-flash",
+                            contents="Ping"
+                        )
                     ),
                     timeout=3.5
                 )
