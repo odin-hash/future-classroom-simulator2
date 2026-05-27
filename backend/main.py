@@ -1272,10 +1272,17 @@ async def health_check(db: Session = Depends(get_db)):
     tts_msg = ""
     try:
         import edge_tts
-        # Just instantiate Edge TTS communicate to verify imports and setup
-        communicate = edge_tts.Communicate("Hello", "en-IN-PrabhatNeural")
-        tts_ok = True
-        tts_msg = "Edge TTS modules loaded"
+        # Run a real synthesis test to verify connection to Edge TTS servers
+        communicate = edge_tts.Communicate("OK", "en-IN-PrabhatNeural")
+        audio_data = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data.extend(chunk["data"])
+        if len(audio_data) > 0:
+            tts_ok = True
+            tts_msg = "Edge TTS engine verified (successful synthesis)"
+        else:
+            tts_msg = "Edge TTS generated empty audio data"
     except Exception as e:
         tts_msg = str(e)
         
@@ -1317,55 +1324,123 @@ async def health_check(db: Session = Depends(get_db)):
 
 
 @app.on_event("startup")
-def run_startup_self_test():
+async def run_startup_self_test():
     print("====================================================")
     print("🚀 Future Classroom Simulator Startup Self-Test")
     print("====================================================")
     
-    # 1. Gemini Key Check
+    # 1. Production Mode Check & Database Url requirements
+    is_prod = (
+        os.environ.get("RENDER") == "true" or
+        bool(os.environ.get("RAILWAY_STATIC_URL")) or
+        os.environ.get("NODE_ENV") == "production"
+    )
+    
+    db_url = os.environ.get("DATABASE_URL")
+    if is_prod and (not db_url or db_url.startswith("sqlite")):
+        print("❌ CRITICAL: Production environment detected but database is missing or configured as SQLite.")
+        print("DATABASE_URL must be set to a valid PostgreSQL connection string in production.")
+        raise RuntimeError("PostgreSQL database is required in production deployment contexts.")
+
+    # 2. Gemini Key Check
     gemini_key = os.environ.get("GEMINI_API_KEY")
     api_key_valid = bool(gemini_key and len(gemini_key.strip()) > 5)
+    
+    gemini_client_initialized = False
+    gemini_model_verified = False
+    
+    if api_key_valid:
+        try:
+            from google import genai as google_genai
+            client = google_genai.Client(api_key=gemini_key)
+            gemini_client_initialized = True
+            
+            # Fast model availability connectivity check
+            import concurrent.futures
+            import asyncio
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        pool,
+                        client.models.generate_content,
+                        "gemini-2.0-flash",
+                        "Ping"
+                    ),
+                    timeout=3.5
+                )
+            if response and response.text:
+                gemini_model_verified = True
+        except Exception as e:
+            print(f"[Gemini Check] Warning: Model connectivity check failed: {e}")
+            
     print(f"Gemini API Key: {'✅ CONFIGURED' if api_key_valid else '❌ MISSING'}")
     
-    # 2. Database Connection Check
+    # 3. Database Connection Check
     db_status = "❌ UNKNOWN"
     try:
         from database import engine
         from sqlalchemy import text
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        db_status = f"✅ CONNECTED ({engine.url.drivername})"
+        db_status = "✅ CONNECTED"
     except Exception as e:
         db_status = f"❌ CONNECTION FAILED: {e}"
     print(f"Database: {db_status}")
     
-    # 3. TTS Engine Check
+    # 4. Edge TTS Engine Check with outbound request validation
     tts_status = "❌ UNKNOWN"
     try:
         import edge_tts
-        # Just create Communicate object to ensure dependency exists
-        edge_tts.Communicate("test", "en-IN-PrabhatNeural")
-        tts_status = "✅ ACTIVE"
+        # Verify outbound network requests by synthesizing a very short text
+        communicate = edge_tts.Communicate("OK", "en-IN-PrabhatNeural")
+        audio_data = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data.extend(chunk["data"])
+        if len(audio_data) > 0:
+            tts_status = "✅ ACTIVE"
+        else:
+            tts_status = "❌ FAILED (Empty audio returned)"
     except Exception as e:
-        tts_status = f"❌ FAILED: {e}"
+        tts_status = f"❌ OFFLINE ({e})"
     print(f"Edge TTS Engine: {tts_status}")
     
-    # 4. STT Engine / Cascade Config
+    # 5. STT Engine / Cascade Config with actual validation
     stt_providers = []
-    if os.environ.get("GEMINI_API_KEY"):
+    
+    # Check Google STT loading from JSON or file path
+    google_stt_ok = False
+    json_creds = os.environ.get("GOOGLE_CREDENTIALS_JSON") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    file_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if json_creds or file_creds:
+        try:
+            from google.cloud import speech
+            if json_creds:
+                import json
+                from google.oauth2 import service_account
+                info = json.loads(json_creds)
+                credentials = service_account.Credentials.from_service_account_info(info)
+                speech.SpeechClient(credentials=credentials)
+            else:
+                speech.SpeechClient()
+            google_stt_ok = True
+            stt_providers.append("Google STT")
+        except Exception as e:
+            print(f"[STT Check] Google STT init warning: {e}")
+            
+    if os.environ.get("GEMINI_API_KEY") and gemini_client_initialized:
         stt_providers.append("Gemini STT")
-    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("GOOGLE_CREDENTIALS_JSON") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON"):
-        stt_providers.append("Google STT")
     if os.environ.get("DEEPGRAM_API_KEY"):
         stt_providers.append("Deepgram")
     if os.environ.get("ASSEMBLYAI_API_KEY"):
         stt_providers.append("AssemblyAI")
         
-    stt_status = f"✅ ACTIVE (Providers: {', '.join(stt_providers)})" if stt_providers else "❌ NO PROVIDERS CONFIGURED (Mock Mode fallback)"
+    stt_status = "✅ ACTIVE" if stt_providers else "❌ OFFLINE"
     print(f"Speech-To-Text STT: {stt_status}")
     
-    # 5. Websocket Readiness
-    print("Websocket Interface: ✅ READY (/api/stream-stt)")
+    # 6. Websocket Readiness
+    print("Websocket Interface: ✅ READY")
     print("====================================================")
     
     # Fail startup if key is missing and ALLOW_MOCK_LLM is not active
@@ -1374,5 +1449,6 @@ def run_startup_self_test():
         print("❌ CRITICAL: GEMINI_API_KEY is not set. Startup aborted.")
         print("To run locally/mock mode without keys, set ALLOW_MOCK_LLM=true.")
         raise RuntimeError("GEMINI_API_KEY is missing. Add it to your environment variables.")
+
 
 
